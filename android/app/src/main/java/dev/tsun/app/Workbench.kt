@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
@@ -50,6 +51,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import java.net.ConnectException
 
 /** Where the main pane points. Kept as plain strings so it survives process death. */
 private object Route {
@@ -62,15 +64,20 @@ private object Route {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-internal fun Workbench(api: DaemonApi, port: Int, initialCatalog: Catalog?, onForget: () -> Unit) {
+internal fun Workbench(
+    api: DaemonApi, port: Int, initial: Overview?, mode: Mode,
+    startDebian: (suspend () -> Overview)?, onMode: (Mode) -> Unit, onForget: () -> Unit,
+) {
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     val scope = rememberCoroutineScope()
     val drawer = rememberDrawerState(DrawerValue.Closed)
-    var catalog by remember(api) { mutableStateOf(initialCatalog) }
-    var runs by remember(api) { mutableStateOf(RunList(emptyList(), 2)) }
-    var threads by remember(api) { mutableStateOf(ThreadList(emptyList(), 3)) }
+    var catalog by remember(api) { mutableStateOf(initial?.catalog) }
+    var runs by remember(api) { mutableStateOf(initial?.runs ?: RunList(emptyList(), 2)) }
+    var threads by remember(api) { mutableStateOf(initial?.threads ?: ThreadList(emptyList(), 3)) }
     var offline by remember(api) { mutableStateOf<String?>(null) }
-    var online by remember(api) { mutableStateOf(initialCatalog != null) }
+    var online by remember(api) { mutableStateOf(initial != null) }
+    var startingDebian by remember(api) { mutableStateOf(false) }
+    var canRetryDebian by remember(api) { mutableStateOf(false) }
     var refresh by remember { mutableIntStateOf(0) }
     var route by rememberSaveable { mutableStateOf(Route.Home) }
     var routeId by rememberSaveable { mutableStateOf<String?>(null) }   // thread or run id
@@ -91,24 +98,41 @@ internal fun Workbench(api: DaemonApi, port: Int, initialCatalog: Catalog?, onFo
     val thread = threads.items.firstOrNull { it.id == routeId }
     val run = runs.items.firstOrNull { it.id == routeId }
 
-    LaunchedEffect(api, lifecycle, refresh) {
+    LaunchedEffect(api, lifecycle, refresh, startDebian) {
+        var hasFreshOverview = initial != null && refresh == 0
         lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
-            var readCatalog = catalog == null
+            var attemptedRoot = false
             while (true) {
-                try {
-                    if (readCatalog) catalog = api.catalog()
-                    runs = api.runs()
-                    threads = api.threads()
-                    online = true
-                    offline = null
-                    readCatalog = false
-                } catch (e: Exception) {
-                    offline = e.userMessage()
-                    online = false
-                    readCatalog = true
+                if (!hasFreshOverview) {
+                    try {
+                        val overview = try { api.overview() }
+                        catch (e: ConnectException) {
+                            if (startDebian == null || attemptedRoot) throw e
+                            attemptedRoot = true
+                            online = false
+                            canRetryDebian = false
+                            startingDebian = true
+                            offline = "Starting Debian…"
+                            try { startDebian() } finally { startingDebian = false }
+                        }
+                        catalog = overview.catalog
+                        runs = overview.runs
+                        threads = overview.threads
+                        online = true
+                        offline = null
+                        canRetryDebian = false
+                        attemptedRoot = false
+                    } catch (e: Exception) {
+                        val message = e.userMessage()
+                        if (!canRetryDebian || e !is ConnectException) offline = message
+                        online = false
+                        canRetryDebian = startDebian != null && attemptedRoot &&
+                            (e is ConnectException || (e is RootLaunchError && e.retryable))
+                    }
                 }
+                hasFreshOverview = false
                 val busy = runs.items.any { it.active } || threads.items.any { it.active }
-                delay(if (busy) 1200L else 3000L)
+                delay(if (busy && online) 1200L else 3000L)
             }
         }
     }
@@ -152,7 +176,11 @@ internal fun Workbench(api: DaemonApi, port: Int, initialCatalog: Catalog?, onFo
     }
 
     fun upsert(updated: AgentThread) {
-        threads = threads.copy(items = listOf(updated) + threads.items.filterNot { it.id == updated.id })
+        val existing = threads.items.firstOrNull { it.id == updated.id }
+        if (existing == updated) return
+        val items = if (existing == null) listOf(updated) + threads.items
+            else threads.items.map { if (it.id == updated.id) updated else it }
+        threads = threads.copy(items = items)
     }
 
     fun startThread(prompt: String, mode: Mode, provider: String?) {
@@ -232,12 +260,13 @@ internal fun Workbench(api: DaemonApi, port: Int, initialCatalog: Catalog?, onFo
         drawerContent = {
             ModalDrawerSheet(
                 drawerState = drawer,
-                modifier = Modifier.widthIn(max = 320.dp),
+                modifier = Modifier.widthIn(max = 320.dp).fillMaxWidth(),
                 drawerShape = RoundedCornerShape(topEnd = 20.dp, bottomEnd = 20.dp),
                 drawerContainerColor = inks.sheet,
                 windowInsets = WindowInsets(0, 0, 0, 0),
             ) {
-                SessionDrawer(
+                // Keep the drawer shell mounted for its slide animation without composing the hidden list.
+                if (drawer.currentValue == DrawerValue.Open || drawer.targetValue == DrawerValue.Open) SessionDrawer(
                     workspaces, threads.items, runs.items, current = routeId.takeIf { route == Route.Thread || route == Route.Run },
                     online = online, port = port,
                     onNew = { go(Route.Home) },
@@ -248,7 +277,7 @@ internal fun Workbench(api: DaemonApi, port: Int, initialCatalog: Catalog?, onFo
             }
         },
     ) {
-        Column(Modifier.fillMaxSize()) {
+        Column(Modifier.fillMaxSize().imePadding()) {
             Row(Modifier.fillMaxWidth().heightIn(min = 54.dp).padding(start = 4.dp, end = 12.dp),
                 verticalAlignment = Alignment.CenterVertically) {
                 GlyphButton(Glyph.Menu, "Open sessions", enabled = !fileBusy) { scope.launch { drawer.open() } }
@@ -259,7 +288,12 @@ internal fun Workbench(api: DaemonApi, port: Int, initialCatalog: Catalog?, onFo
                 }
             }
             offline?.let {
-                PageWidth { Notice(it, Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), error = true) }
+                PageWidth {
+                    Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) {
+                        Notice(it, Modifier.fillMaxWidth(), error = !startingDebian)
+                        if (canRetryDebian) TextButton(onClick = { refresh++ }) { Text("Retry Debian startup") }
+                    }
+                }
             }
             PageWidth(Modifier.weight(1f)) {
                 when (route) {
@@ -269,7 +303,7 @@ internal fun Workbench(api: DaemonApi, port: Int, initialCatalog: Catalog?, onFo
                             EmptyNote("Session not found", "Start a new one from the menu.", Modifier.padding(20.dp))
                         } else screenState.SaveableStateProvider("thread:$id") {
                             ThreadScreen(api, id, thread, providers, handlesBack = drawer.isClosed,
-                                onBack = { go(Route.Home) }, onThread = ::upsert,
+                                onBack = { go(Route.Home) }, onThread = ::upsert, onMode = onMode,
                                 onReview = { navigate { route = Route.Review } },
                                 onFiles = { openFiles(id, true) })
                         }
@@ -323,9 +357,9 @@ internal fun Workbench(api: DaemonApi, port: Int, initialCatalog: Catalog?, onFo
                     else -> screenState.SaveableStateProvider("home") {
                         NewSessionScreen(
                             workspace, workspaces, providers, catalog?.defaultProvider,
-                            recent = threads.items.filter { it.workspace == workspace?.id },
+                            recent = remember(threads.items, workspace?.id) { threads.items.filter { it.workspace == workspace?.id }.take(5) },
                             online = online, busy = submitting, error = actionError,
-                            onWorkspace = { workspaceId = it.id },
+                            mode = mode, onMode = onMode, onWorkspace = { workspaceId = it.id },
                             onStart = ::startThread, onPreset = ::launchPreset, onOpen = ::openThread,
                         )
                     }
@@ -341,8 +375,8 @@ private fun SessionDrawer(
     online: Boolean, port: Int, onNew: () -> Unit, onThread: (AgentThread) -> Unit, onRun: (Run) -> Unit,
     onProjectFiles: (Workspace) -> Unit, onForget: () -> Unit,
 ) {
-    val threadsByProject = threads.groupBy { it.workspace }
-    val runsByProject = runs.groupBy { it.workspace }
+    val threadsByProject = remember(threads) { threads.groupBy { it.workspace } }
+    val runsByProject = remember(runs) { runs.groupBy { it.workspace } }
     Column(Modifier.fillMaxHeight().padding(horizontal = 12.dp)) {
         Row(Modifier.padding(start = 10.dp, top = 22.dp, bottom = 16.dp),
             verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {

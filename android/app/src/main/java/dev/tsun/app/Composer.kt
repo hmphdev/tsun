@@ -16,12 +16,17 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.input.InputTransformation
+import androidx.compose.foundation.text.input.TextFieldLineLimits
+import androidx.compose.foundation.text.input.TextFieldState
+import androidx.compose.foundation.text.input.maxLength
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -43,8 +48,7 @@ internal const val MessageLimit = 32_000
  */
 @Composable
 internal fun Composer(
-    text: String,
-    onText: (String) -> Unit,
+    draft: TextFieldState,
     placeholder: String,
     mode: Mode,
     onMode: (Mode) -> Unit,
@@ -54,7 +58,7 @@ internal fun Composer(
     working: Boolean,
     canSend: Boolean,
     busy: Boolean,
-    onSend: () -> Unit,
+    onSend: (String) -> Unit,
     onStop: () -> Unit,
     modifier: Modifier = Modifier,
     leading: @Composable RowScope.() -> Unit = {},
@@ -62,19 +66,21 @@ internal fun Composer(
     Surface(modifier.fillMaxWidth(), shape = RoundedCornerShape(22.dp), color = inks.raised,
         border = BorderStroke(1.dp, inks.rule)) {
         Column(Modifier.padding(start = 6.dp, end = 8.dp, top = 6.dp, bottom = 8.dp)) {
+            val empty by remember(draft) { derivedStateOf { draft.text.isEmpty() } }
+            val hasText by remember(draft) { derivedStateOf { draft.text.isNotBlank() } }
             BasicTextField(
-                value = text,
-                onValueChange = { if (it.length <= MessageLimit) onText(it) },
+                state = draft,
+                inputTransformation = remember { InputTransformation.maxLength(MessageLimit) },
                 modifier = Modifier.fillMaxWidth().semantics { contentDescription = "Message" },
                 enabled = !busy,
                 textStyle = MaterialTheme.typography.bodyLarge.copy(color = inks.ink),
                 cursorBrush = SolidColor(inks.accent),
-                maxLines = 8,
-                keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
-                decorationBox = { input ->
+                lineLimits = TextFieldLineLimits.MultiLine(maxHeightInLines = 8),
+                keyboardOptions = remember { KeyboardOptions(capitalization = KeyboardCapitalization.Sentences) },
+                decorator = { input ->
                     Box(Modifier.fillMaxWidth().heightIn(min = 46.dp).padding(horizontal = 12.dp, vertical = 11.dp),
                         contentAlignment = Alignment.TopStart) {
-                        if (text.isEmpty()) Text(placeholder, color = inks.faint, style = MaterialTheme.typography.bodyLarge,
+                        if (empty) Text(placeholder, color = inks.faint, style = MaterialTheme.typography.bodyLarge,
                             maxLines = 1, overflow = TextOverflow.Ellipsis)
                         input()
                     }
@@ -89,7 +95,9 @@ internal fun Composer(
                 }
                 Spacer(Modifier.width(8.dp))
                 if (working) RoundAction(Glyph.Stop, "Stop the agent", enabled = !busy, filled = false, onClick = onStop)
-                else RoundAction(Glyph.Up, "Send", enabled = canSend && !busy && text.isNotBlank(), filled = true, onClick = onSend)
+                else RoundAction(Glyph.Up, "Send", enabled = canSend && !busy && hasText, filled = true) {
+                    onSend(draft.text.toString().trim())
+                }
             }
         }
     }

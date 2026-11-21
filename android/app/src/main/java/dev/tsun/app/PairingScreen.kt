@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
@@ -22,6 +23,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -37,14 +39,15 @@ import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 
 @Composable
-internal fun PairingScreen(onPair: (Pairing, Catalog) -> Unit) {
+internal fun PairingScreen(onPair: (Pairing, Overview, Boolean) -> Unit) {
     // Don't put the unsubmitted code in Activity saved state.
     var code by remember { mutableStateOf("") }
     var connecting by remember { mutableStateOf(false) }
+    var startingDebian by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
     val pairing = remember(code) { Pairing.parse(code) }
-    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
+    Box(Modifier.fillMaxSize().imePadding(), contentAlignment = Alignment.TopCenter) {
         Column(Modifier.widthIn(max = 480.dp).fillMaxWidth().verticalScroll(rememberScrollState())
             .padding(horizontal = 25.dp, vertical = 25.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(9.dp)) {
@@ -79,7 +82,7 @@ internal fun PairingScreen(onPair: (Pairing, Catalog) -> Unit) {
                             scope.launch {
                                 error = null
                                 connecting = true
-                                try { onPair(candidate, DaemonApi(candidate).catalog()) }
+                                try { onPair(candidate, DaemonApi(candidate).overview(), false) }
                                 catch (e: Exception) { error = e.userMessage() }
                                 finally { connecting = false }
                             }
@@ -87,9 +90,30 @@ internal fun PairingScreen(onPair: (Pairing, Catalog) -> Unit) {
                         modifier = Modifier.fillMaxWidth().height(49.dp), enabled = pairing != null && !connecting,
                         shape = Corner,
                     ) {
-                        if (connecting) CircularProgressIndicator(Modifier.padding(end = 9.dp).size(16.dp), strokeWidth = 2.dp)
-                        Text(if (connecting) "Pairing…" else "Connect to Debian")
+                        if (connecting && !startingDebian) CircularProgressIndicator(Modifier.padding(end = 9.dp).size(16.dp), strokeWidth = 2.dp)
+                        Text(if (connecting && !startingDebian) "Pairing…" else "Connect to Debian")
                     }
+                    TextButton(
+                        enabled = !connecting,
+                        onClick = {
+                            connecting = true
+                            startingDebian = true
+                            error = null
+                            scope.launch {
+                                try {
+                                    val (local, overview) = RootLauncher.pair()
+                                    onPair(local, overview, true)
+                                } catch (e: Exception) {
+                                    error = e.userMessage()
+                                } finally {
+                                    startingDebian = false
+                                    connecting = false
+                                }
+                            }
+                        },
+                    ) { Text(if (startingDebian) "Starting Debian…" else "Pair via root") }
+                    Text("For chroot-distro's Debian install. Grant Tsun root in your root manager to start the daemon without opening Termux.",
+                        color = inks.quiet, style = MaterialTheme.typography.bodySmall)
                 }
             }
         }

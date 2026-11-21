@@ -31,11 +31,9 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
-import androidx.compose.runtime.getValue
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
@@ -46,6 +44,7 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.scale
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
@@ -54,6 +53,7 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.LineBreak
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -111,7 +111,7 @@ private val Type = Typography(
     labelSmall = TextStyle(fontFamily = Interface, fontWeight = FontWeight.SemiBold, fontSize = 11.sp, lineHeight = 15.sp, letterSpacing = 1.2.sp),
 )
 /** Assistant prose: a reading serif, like a reply rather than a log. */
-internal val ProseType = TextStyle(fontFamily = Reading, fontSize = 17.sp, lineHeight = 26.sp)
+internal val ProseType = TextStyle(fontFamily = Reading, fontSize = 17.sp, lineHeight = 26.sp, lineBreak = LineBreak.Paragraph)
 internal val CodeType = TextStyle(fontFamily = Mono, fontSize = 12.5.sp, lineHeight = 19.sp)
 internal val SmallCode = TextStyle(fontFamily = Mono, fontSize = 11.5.sp, lineHeight = 17.sp)
 internal val Corner = RoundedCornerShape(14.dp)
@@ -178,12 +178,12 @@ internal fun EmptyNote(title: String, message: String, modifier: Modifier = Modi
 
 @Composable
 internal fun StatusDot(color: Color, modifier: Modifier = Modifier, pulsing: Boolean = false, size: Int = 7) {
-    val alpha = if (pulsing) {
+    val pulse = if (pulsing) {
         val transition = rememberInfiniteTransition(label = "pulse")
-        val value by transition.animateFloat(0.35f, 1f, infiniteRepeatable(tween(850), RepeatMode.Reverse), label = "alpha")
-        value
-    } else 1f
-    Box(modifier.size(size.dp).alpha(alpha).background(color, CircleShape))
+        val opacity = transition.animateFloat(0.35f, 1f, infiniteRepeatable(tween(850), RepeatMode.Reverse), label = "alpha")
+        Modifier.graphicsLayer { alpha = opacity.value }
+    } else Modifier
+    Box(modifier.size(size.dp).then(pulse).background(color, CircleShape))
 }
 
 /** Small rounded chip used for project, branch, model, and mode. */
