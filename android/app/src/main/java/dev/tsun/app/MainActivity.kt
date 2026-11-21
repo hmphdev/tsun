@@ -7,8 +7,13 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.displayCutout
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.systemBars
+import androidx.compose.foundation.layout.union
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
@@ -29,7 +34,8 @@ class MainActivity : ComponentActivity() {
                 var pairing by remember { mutableStateOf(saved) }
                 var workspaces by remember { mutableStateOf(emptyList<Workspace>()) }
                 Surface(Modifier.fillMaxSize(), color = inks.paper, contentColor = inks.ink) {
-                    Box(Modifier.fillMaxSize().background(inks.paper).safeDrawingPadding()) {
+                    Box(Modifier.fillMaxSize().background(inks.paper)
+                        .windowInsetsPadding(WindowInsets.systemBars.union(WindowInsets.displayCutout)).imePadding()) {
                         val local = pairing
                         if (local == null) {
                             PairingScreen { newPairing, catalog ->

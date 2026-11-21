@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(mobile-harness VERSION 0.1.0 LANGUAGES CXX)
+project(mobile-harness VERSION 0.2.0 LANGUAGES CXX)
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
     message(FATAL_ERROR "The daemon needs Linux and glibc 2.34+ (e.g. Debian 12+).")

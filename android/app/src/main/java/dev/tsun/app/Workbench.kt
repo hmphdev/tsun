@@ -67,6 +67,7 @@ internal fun Workbench(api: DaemonApi, port: Int, initialWorkspaces: List<Worksp
     var workspaceId by rememberSaveable { mutableStateOf<String?>(null) }
     var runId by rememberSaveable { mutableStateOf<String?>(null) }
     var showFiles by rememberSaveable { mutableStateOf(false) }
+    var fileRunId by rememberSaveable { mutableStateOf<String?>(null) }
     val screenState = rememberSaveableStateHolder()
     var dirty by remember { mutableStateOf(false) }
     var fileBusy by remember { mutableStateOf(false) }
@@ -76,6 +77,7 @@ internal fun Workbench(api: DaemonApi, port: Int, initialWorkspaces: List<Worksp
     var submitting by remember { mutableStateOf(false) }
     val workspace = workspaces.firstOrNull { it.id == workspaceId } ?: workspaces.firstOrNull()
     val selected = runs.items.firstOrNull { it.id == runId }
+    val fileTask = runs.items.firstOrNull { it.id == fileRunId && it.workspace == workspace?.id }
 
     LaunchedEffect(api, lifecycle, refresh) {
         lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
@@ -105,19 +107,28 @@ internal fun Workbench(api: DaemonApi, port: Int, initialWorkspaces: List<Worksp
 
     fun selectRun(run: Run?) = navigate {
         showFiles = false
+        fileRunId = null
         runId = run?.id
         if (run != null) workspaceId = run.workspace
         actionError = null
     }
 
-    fun launchPreset(preset: Preset) {
+    fun focusProject(project: Workspace, browse: Boolean) = navigate {
+        if (workspace?.id != project.id || !browse) runId = null
+        workspaceId = project.id
+        showFiles = browse
+        fileRunId = null
+        actionError = null
+    }
+
+    fun launchPreset(preset: Preset, title: String) {
         val target = workspace ?: return
         if (submitting) return
         submitting = true
         actionError = null
         scope.launch {
             try {
-                val run = api.launch(target.id, preset.id)
+                val run = api.launch(target.id, preset.id, title)
                 runs = runs.copy(items = (listOf(run) + runs.items.filterNot { it.id == run.id }).take(32))
                 selectRun(run)
             } catch (e: Exception) { actionError = e.userMessage() }
@@ -169,15 +180,12 @@ internal fun Workbench(api: DaemonApi, port: Int, initialWorkspaces: List<Worksp
                 drawerContainerColor = inks.sheet,
                 windowInsets = WindowInsets(0, 0, 0, 0),
             ) {
-                TaskDrawer(workspaces, workspace, runs.items, selected, showFiles, online, port,
+                TaskDrawer(workspaces, workspace, runs.items, selected, showFiles, fileRunId, online, port,
                     onNew = { selectRun(null) },
-                    onWorkspace = { chosen ->
-                        if (!showFiles || workspace?.id != chosen.id) navigate {
-                            if (workspace?.id != chosen.id) runId = null
-                            workspaceId = chosen.id
-                            showFiles = true
-                            actionError = null
-                        } else scope.launch { drawer.close() }
+                    onProject = { chosen -> focusProject(chosen, browse = false) },
+                    onProjectFiles = { chosen ->
+                        if (showFiles && workspace?.id == chosen.id && fileRunId == null) scope.launch { drawer.close() }
+                        else focusProject(chosen, browse = true)
                     },
                     onRun = { chosen -> selectRun(chosen) },
                     onForget = { scope.launch { drawer.close() }; confirmForget = true },
@@ -194,11 +202,16 @@ internal fun Workbench(api: DaemonApi, port: Int, initialWorkspaces: List<Worksp
                 TsunMark(Modifier.size(20.dp))
                 Text("Tsun", Modifier.padding(start = 7.dp).weight(1f),
                     style = MaterialTheme.typography.headlineSmall, maxLines = 1)
-                TextButton(onClick = { navigate { showFiles = !showFiles; actionError = null } },
-                    enabled = workspace != null && !fileBusy) {
+                TextButton(onClick = {
+                    navigate {
+                        showFiles = !showFiles
+                        fileRunId = if (showFiles && selected?.branch != null) selected.id else null
+                        actionError = null
+                    }
+                }, enabled = !fileBusy && (showFiles || (workspace != null && selected?.filesReady != false))) {
                     LineIcon(if (showFiles) Glyph.Runs else Glyph.Folder, color = inks.pine, size = 17)
                     Spacer(Modifier.width(7.dp))
-                    Text(if (showFiles) "Runs" else "Files")
+                    Text(if (showFiles) "Tasks" else if (selected?.branch != null) "Task files" else "Files")
                 }
             }
             HorizontalDivider(color = inks.rule)
@@ -209,11 +222,16 @@ internal fun Workbench(api: DaemonApi, port: Int, initialWorkspaces: List<Worksp
             }
             PageWidth(Modifier.weight(1f)) {
                 val current = workspace
-                if (showFiles && current != null) {
-                    screenState.SaveableStateProvider("files:${current.id}") {
-                        FilesScreen(api, current, handlesBack = drawer.isClosed,
-                            onDirtyChange = { dirty = it }, onBusyChange = { fileBusy = it },
-                            onHome = { navigate { showFiles = false } })
+                if (showFiles) {
+                    val taskId = fileRunId
+                    if (current == null) {
+                        EmptyNote("No project loaded", "Connect to Debian to open your files.",
+                            Modifier.padding(horizontal = 21.dp, vertical = 20.dp))
+                    } else screenState.SaveableStateProvider("files:${current.id}:${taskId.orEmpty()}") {
+                        val title = if (taskId == null) current.label else fileTask?.label ?: "Task files"
+                        FilesScreen(api, FileScope(current.id, taskId), title, fileTask?.branch,
+                            handlesBack = drawer.isClosed, onDirtyChange = { dirty = it },
+                            onBusyChange = { fileBusy = it }, onHome = { navigate { showFiles = false; fileRunId = null } })
                     }
                 } else {
                     screenState.SaveableStateProvider("runs") {
@@ -230,9 +248,10 @@ internal fun Workbench(api: DaemonApi, port: Int, initialWorkspaces: List<Worksp
 @Composable
 private fun TaskDrawer(
     workspaces: List<Workspace>, workspace: Workspace?, runs: List<Run>, selected: Run?, files: Boolean,
-    online: Boolean, port: Int, onNew: () -> Unit, onWorkspace: (Workspace) -> Unit,
-    onRun: (Run) -> Unit, onForget: () -> Unit,
+    fileRunId: String?, online: Boolean, port: Int, onNew: () -> Unit, onProject: (Workspace) -> Unit,
+    onProjectFiles: (Workspace) -> Unit, onRun: (Run) -> Unit, onForget: () -> Unit,
 ) {
+    val byProject = runs.groupBy { it.workspace }
     Column(Modifier.fillMaxHeight().padding(horizontal = 15.dp)) {
         Row(Modifier.padding(start = 11.dp, top = 25.dp, bottom = 16.dp),
             verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(11.dp)) {
@@ -242,32 +261,39 @@ private fun TaskDrawer(
                 Eyebrow("LOCAL WORKBENCH")
             }
         }
-        DrawerRow("New run", Glyph.Plus, false, onNew)
+        DrawerRow("New task", Glyph.Plus, false, onNew)
         HorizontalDivider(Modifier.padding(top = 9.dp), color = inks.rule)
         LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(bottom = 16.dp)) {
-            item { Eyebrow("WORKSPACES", Modifier.padding(start = 11.dp, top = 19.dp, bottom = 6.dp)) }
+            item { Eyebrow("PROJECTS", Modifier.padding(start = 11.dp, top = 18.dp, bottom = 5.dp)) }
             if (workspaces.isEmpty()) item {
-                Text("No workspaces loaded", Modifier.padding(start = 11.dp, top = 4.dp), color = inks.quiet)
+                Text("No projects loaded", Modifier.padding(start = 11.dp, top = 4.dp), color = inks.quiet)
             }
-            items(workspaces, key = { "workspace:${it.id}" }) { item ->
-                DrawerRow(item.label, Glyph.Folder, files && workspace?.id == item.id, { onWorkspace(item) })
-            }
-            item { Eyebrow("RECENT RUNS", Modifier.padding(start = 11.dp, top = 22.dp, bottom = 6.dp)) }
-            if (runs.isEmpty()) item {
-                Text("Nothing has run yet", Modifier.padding(start = 11.dp, top = 4.dp), color = inks.quiet)
-            }
-            items(runs, key = { "run:${it.id}" }) { run ->
-                Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(9.dp))
-                    .background(if (!files && selected?.id == run.id) inks.moss else Color.Transparent)
-                    .clickable(role = Role.Button) { onRun(run) }
-                    .heightIn(min = 48.dp).padding(horizontal = 11.dp, vertical = 7.dp),
-                    verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    StatusDot(if (run.state == "failed") inks.rust else if (run.active) inks.pine else inks.quiet)
-                    Column {
-                        Text(run.label, style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        Text(workspaces.firstOrNull { it.id == run.workspace }?.label ?: run.workspace,
-                            style = MaterialTheme.typography.bodySmall, color = inks.quiet, maxLines = 1,
-                            overflow = TextOverflow.Ellipsis)
+            for (project in workspaces) {
+                val tasks = byProject[project.id].orEmpty()
+                item(key = "project:${project.id}") {
+                    val here = workspace?.id == project.id && (files && fileRunId == null || !files && selected == null)
+                    Row(Modifier.fillMaxWidth().padding(top = 5.dp).clip(RoundedCornerShape(9.dp))
+                        .background(if (here) inks.moss else Color.Transparent), verticalAlignment = Alignment.CenterVertically) {
+                        Row(Modifier.weight(1f).clickable(role = Role.Button) { onProject(project) }
+                            .heightIn(min = 48.dp).padding(start = 11.dp, end = 5.dp),
+                            verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(9.dp)) {
+                            LineIcon(Glyph.Folder, color = inks.pine, size = 17)
+                            Text(project.label, style = MaterialTheme.typography.titleMedium,
+                                maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
+                        GlyphButton(Glyph.File, "Browse ${project.label} checkout") { onProjectFiles(project) }
+                    }
+                }
+                items(tasks, key = { "run:${it.id}" }) { run ->
+                    val here = (if (files) fileRunId else selected?.id) == run.id
+                    Row(Modifier.fillMaxWidth().padding(start = 13.dp).clip(RoundedCornerShape(8.dp))
+                        .background(if (here) inks.moss else Color.Transparent)
+                        .clickable(role = Role.Button) { onRun(run) }
+                        .heightIn(min = 48.dp).padding(start = 12.dp, end = 7.dp, top = 6.dp, bottom = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(9.dp)) {
+                        Text(run.label, Modifier.weight(1f), style = MaterialTheme.typography.titleSmall,
+                            maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        RunState(run)
                     }
                 }
             }

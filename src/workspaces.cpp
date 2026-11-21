@@ -66,12 +66,12 @@ struct stat stat_fd(const Fd& fd) {
     return info;
 }
 
-bool safe_file(const struct stat& info, const Workspace& workspace) {
+bool safe_file(const struct stat& info, const FileRoot& workspace) {
     return info.st_dev == workspace.device && S_ISREG(info.st_mode) && info.st_nlink == 1
         && (info.st_mode & (S_ISUID | S_ISGID)) == 0;
 }
 
-Fd open_directory(const Workspace& workspace, const std::vector<std::string>& parts) {
+Fd open_directory(const FileRoot& workspace, const std::vector<std::string>& parts) {
     // Open a fresh handle at each level, including for readdir on the root. dup() would
     // share the directory stream position between simultaneous listings.
     Fd dir(::openat(workspace.directory.get(), ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
@@ -87,7 +87,7 @@ Fd open_directory(const Workspace& workspace, const std::vector<std::string>& pa
 
 struct FileLocation { Fd parent; std::string name; };
 
-FileLocation locate(const Workspace& workspace, std::string_view path) {
+FileLocation locate(const FileRoot& workspace, std::string_view path) {
     auto parts = components(path);
     if (parts.empty()) throw Error(400, "A file path is required");
     auto name = std::move(parts.back());
@@ -97,7 +97,7 @@ FileLocation locate(const Workspace& workspace, std::string_view path) {
 
 struct OpenFile { Fd fd; struct stat info; };
 
-OpenFile open_regular(const Workspace& workspace, const FileLocation& file) {
+OpenFile open_regular(const FileRoot& workspace, const FileLocation& file) {
     Fd handle(::openat(file.parent.get(), file.name.c_str(), O_PATH | O_NOFOLLOW | O_CLOEXEC));
     if (!handle) path_error();
     const auto info = stat_fd(handle);
@@ -179,9 +179,10 @@ Json Configuration::catalog() const {
         for (const auto& command : workspace.commands) {
             commands.push_back({{"id", command.id}, {"label", command.label}});
         }
-        result.push_back({{"id", workspace.id}, {"label", workspace.label}, {"commands", std::move(commands)}});
+        result.push_back({{"id", workspace.id}, {"label", workspace.label}, {"worktrees", workspace.worktrees},
+            {"commands", std::move(commands)}});
     }
-    return {{"workspaces", std::move(result)}, {"protocol", 1}};
+    return {{"workspaces", std::move(result)}, {"protocol", 2}};
 }
 
 Configuration load_config(const char* state_path) {
@@ -207,7 +208,7 @@ Configuration load_config(const char* state_path) {
     const auto& entries = config.at("workspaces");
     if (!entries.is_array() || entries.empty() || entries.size() > 32) throw std::runtime_error("Configure 1–32 workspaces");
     Configuration result{port.get<int>(), {}, std::move(token), read_state(state, "cert.pem", 16 * 1024, false),
-        read_state(state, "key.pem", 16 * 1024)};
+        read_state(state, "key.pem", 16 * 1024), state_root.string()};
     std::set<std::string> workspace_ids;
     for (const auto& entry : entries) {
         auto id = id_field(entry);
@@ -225,12 +226,10 @@ Configuration load_config(const char* state_path) {
             || within(root, state_root) || within(state_root, root)) {
             throw std::runtime_error("Pick a project directory separate from the daemon state and your home directory");
         }
-        Fd dir(::open(root.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
-        if (!dir) throw std::runtime_error("Could not open workspace directory: " + id);
-        const auto device = stat_fd(dir).st_dev;
         const auto commands = entry.value("commands", Json::array());
         if (!commands.is_array() || commands.size() > 32) throw std::runtime_error("commands must be an array of up to 32 presets");
-        Workspace workspace{std::move(id), std::move(label), std::move(dir), device, {}};
+        Workspace workspace{std::move(id), std::move(label), open_file_root(root.c_str()),
+            entry.value("worktrees", true), {}};
         std::set<std::string> command_ids;
         for (const auto& item : commands) {
             auto command_id = id_field(item);
@@ -248,7 +247,14 @@ Configuration load_config(const char* state_path) {
     return result;
 }
 
-Json list_directory(const Workspace& workspace, std::string_view path) {
+FileRoot open_file_root(const char* path) {
+    Fd directory(::open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+    if (!directory) path_error();
+    const auto device = stat_fd(directory).st_dev;
+    return {std::move(directory), device};
+}
+
+Json list_directory(const FileRoot& workspace, std::string_view path) {
     auto fd = open_directory(workspace, components(path));
     const auto close_dir = [](DIR* handle) { ::closedir(handle); };
     std::unique_ptr<DIR, decltype(close_dir)> dir(::fdopendir(fd.get()), close_dir);
@@ -282,7 +288,7 @@ Json list_directory(const Workspace& workspace, std::string_view path) {
     return {{"entries", std::move(files)}, {"truncated", truncated}};
 }
 
-TextFile read_text(const Workspace& workspace, std::string_view path) {
+TextFile read_text(const FileRoot& workspace, std::string_view path) {
     const auto file = open_regular(workspace, locate(workspace, path));
     if (file.info.st_size > static_cast<off_t>(text_limit)) throw Error(413, "Text editor limit is 1 MiB");
     auto text = read_bounded(file.fd, text_limit);
@@ -292,7 +298,7 @@ TextFile read_text(const Workspace& workspace, std::string_view path) {
     return {std::move(text), revision};
 }
 
-std::string write_text(const Workspace& workspace, std::string_view path,
+std::string write_text(const FileRoot& workspace, std::string_view path,
                        std::string_view text, std::string_view revision) {
     if (text.size() > text_limit) throw Error(413, "Text editor limit is 1 MiB");
     if (!utf8_text(text)) throw Error(415, "Save must contain UTF-8 text without NULs");
@@ -332,7 +338,7 @@ std::string write_text(const Workspace& workspace, std::string_view path,
     return revision_of(stat_fd(output));
 }
 
-Download open_download(const Workspace& workspace, std::string_view path) {
+Download open_download(const FileRoot& workspace, std::string_view path) {
     auto file = open_regular(workspace, locate(workspace, path));
     if (file.info.st_size < 0 || static_cast<std::uintmax_t>(file.info.st_size) > artifact_limit) {
         throw Error(413, "Download limit is 64 MiB");

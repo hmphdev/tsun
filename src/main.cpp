@@ -12,6 +12,7 @@
 #include <cerrno>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <string_view>
 #include <thread>
 
@@ -51,7 +52,7 @@ std::string fingerprint(SSL_CTX* context) {
     return digest;
 }
 
-std::string query(const Request& request, const char* key, bool optional = false) {
+std::optional<std::string> find_query(const Request& request, const char* key) {
     // httplib collapses identical pairs, so count keys in the raw query as well.
     const std::string_view target = request.target;
     const auto marker = target.find('?');
@@ -66,12 +67,26 @@ std::string query(const Request& request, const char* key, bool optional = false
             remaining.remove_prefix(separator + 1);
         }
     }
-    if (count == 0 && optional) return {};
+    if (count == 0) return std::nullopt;
     if (count != 1 || request.get_param_value_count(key) != 1) {
         throw Error(400, std::string("Expected one query parameter: ") + key);
     }
     return request.get_param_value(key);
 }
+
+std::string query(const Request& request, const char* key) {
+    auto value = find_query(request, key);
+    if (!value) throw Error(400, std::string("Missing query parameter: ") + key);
+    return std::move(*value);
+}
+
+// Keep a task's directory handle alive for the whole request, even if its run
+// falls out of history. An unknown task must never open the project checkout.
+struct FileScope {
+    const tsun::Workspace& workspace;
+    std::shared_ptr<const tsun::FileRoot> task;
+    const tsun::FileRoot& root() const { return task ? *task : workspace.root; }
+};
 
 Json object_body(const Request& request) {
     auto value = Json::parse(request.body, nullptr, false);
@@ -116,7 +131,12 @@ int serve(const tsun::Configuration& config, httplib::SSLServer& server) {
         throw std::runtime_error("Could not set up shutdown signals");
     }
 
-    tsun::Jobs jobs;
+    tsun::Jobs jobs(config.state_path);
+    const auto scope = [&](const Request& request) -> FileScope {
+        const auto& workspace = config.workspace(query(request, "workspace"));
+        const auto run = find_query(request, "run");
+        return {workspace, run ? jobs.files(workspace, *run) : nullptr};
+    };
     server.new_task_queue = [] { return new httplib::ThreadPool(4, 4, 16); };
     server.set_payload_max_length(tsun::text_limit);
     server.set_keep_alive_max_count(1);
@@ -159,34 +179,35 @@ int serve(const tsun::Configuration& config, httplib::SSLServer& server) {
 
     server.Get("/v1/workspaces", [&](const Request&, Response& res) { respond(res, config.catalog()); });
     server.Get("/v1/entries", [&](const Request& req, Response& res) {
-        respond(res, tsun::list_directory(config.workspace(query(req, "workspace")), query(req, "path", true)));
+        respond(res, tsun::list_directory(scope(req).root(), find_query(req, "path").value_or("")));
     });
     server.Get("/v1/file", [&](const Request& req, Response& res) {
-        const auto file = tsun::read_text(config.workspace(query(req, "workspace")), query(req, "path"));
+        const auto file = tsun::read_text(scope(req).root(), query(req, "path"));
         respond(res, {{"text", file.text}, {"revision", file.revision}});
     });
     server.Put("/v1/file", [&](const Request& req, Response& res) {
-        const auto& workspace = config.workspace(query(req, "workspace"));
+        const auto files = scope(req);
         const auto path = query(req, "path");
         if (req.get_header_value_count("If-Match") != 1) throw Error(428, "Open the file first to get its revision");
         const auto type = req.get_header_value("Content-Type");
         if (type != "text/plain" && type != "text/plain; charset=utf-8") throw Error(415, "Use text/plain; charset=utf-8");
-        const auto revision = tsun::write_text(workspace, path, req.body, req.get_header_value("If-Match"));
+        const auto revision = tsun::write_text(files.root(), path, req.body, req.get_header_value("If-Match"));
         respond(res, {{"revision", revision}});
     });
     server.Get("/v1/download", [&](const Request& req, Response& res) {
-        download(res, tsun::open_download(config.workspace(query(req, "workspace")), query(req, "path")));
+        download(res, tsun::open_download(scope(req).root(), query(req, "path")));
     });
     server.Get("/v1/jobs", [&](const Request&, Response& res) { respond(res, jobs.list()); });
     server.Post("/v1/jobs", [&](const Request& req, Response& res) {
         const auto body = object_body(req);
         const auto& workspace = config.workspace(string_field(body, "workspace"));
-        respond(res, jobs.launch(workspace, workspace.command(string_field(body, "command"))), 201);
+        const auto title = body.contains("title") ? string_field(body, "title") : std::string{};
+        respond(res, jobs.launch(workspace, workspace.command(string_field(body, "command")), title), 201);
     });
-    server.Get(R"(/v1/jobs/([0-9]{1,20}))", [&](const Request& req, Response& res) {
+    server.Get(R"(/v1/jobs/([a-f0-9]{24}))", [&](const Request& req, Response& res) {
         respond(res, jobs.details(req.matches[1].str()));
     });
-    server.Post(R"(/v1/jobs/([0-9]{1,20})/stop)", [&](const Request& req, Response& res) {
+    server.Post(R"(/v1/jobs/([a-f0-9]{24})/stop)", [&](const Request& req, Response& res) {
         respond(res, jobs.stop(req.matches[1].str()));
     });
 
@@ -208,7 +229,7 @@ int serve(const tsun::Configuration& config, httplib::SSLServer& server) {
 
 int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--version") {
-        std::cout << "Tsun daemon 0.1.0 (API v1)\n";
+        std::cout << "Tsun daemon 0.2.0 (protocol 2)\n";
         return 0;
     }
     const bool print_code = argc == 3 && std::string_view(argv[1]) == "--pairing-code";

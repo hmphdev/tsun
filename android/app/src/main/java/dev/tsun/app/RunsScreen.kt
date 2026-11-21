@@ -24,6 +24,9 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.Button
 import androidx.compose.material3.DropdownMenu
@@ -44,7 +47,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
@@ -57,23 +66,28 @@ import kotlinx.coroutines.flow.collect
 internal fun RunsScreen(
     api: DaemonApi, workspace: Workspace?, catalog: List<Workspace>, runs: RunList, selected: Run?,
     online: Boolean, busy: Boolean, error: String?, handlesBack: Boolean,
-    onSelect: (Run) -> Unit, onNew: () -> Unit, onLaunch: (Preset) -> Unit, onStop: (Run) -> Unit,
+    onSelect: (Run) -> Unit, onNew: () -> Unit, onLaunch: (Preset, String) -> Unit, onStop: (Run) -> Unit,
 ) {
     BackHandler(enabled = handlesBack && selected != null, onBack = onNew)
     val positions = rememberSaveableStateHolder()
-    val active = runs.items.filter { it.active }.sortedBy { it.id.toLongOrNull() ?: 0L }
+    val active = runs.items.filter { it.active }.asReversed()
+    var title by rememberSaveable(workspace?.id, selected?.id) { mutableStateOf("") }
     Column(Modifier.fillMaxSize()) {
         if (selected == null) {
             Welcome(workspace, runs.items, onSelect, Modifier.weight(1f))
         } else {
             positions.SaveableStateProvider(selected.id) {
                 RunTranscript(api, selected, catalog.firstOrNull { it.id == selected.workspace }?.label,
-                    onNew, Modifier.weight(1f))
+                    Modifier.weight(1f))
             }
             if (active.any { it.id != selected.id }) ActiveRuns(active, selected.id, onSelect)
         }
         error?.let { Notice(it, Modifier.fillMaxWidth().padding(horizontal = 20.dp), error = true) }
-        RunDock(workspace, selected, active.size, runs.capacity, online, busy, onLaunch, onStop)
+        if (selected == null) {
+            TaskComposer(workspace, title, { title = it }, active.size, runs.capacity, online, busy, onLaunch)
+        } else {
+            TaskActions(selected, online, busy, onNew, onStop)
+        }
     }
 }
 
@@ -89,11 +103,10 @@ private fun ActiveRuns(runs: List<Run>, selectedId: String, onSelect: (Run) -> U
                 Row(Modifier.selectable(selected = selected, role = Role.Tab, onClick = { onSelect(run) })
                     .heightIn(min = 46.dp).padding(horizontal = 10.dp, vertical = 5.dp),
                     verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-                    StatusDot(if (run.state == "running") inks.pine else inks.quiet)
                     Column(Modifier.weight(1f)) {
                         Text(run.label, style = MaterialTheme.typography.titleSmall,
                             maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        Text("Run ${run.id}", style = MaterialTheme.typography.bodySmall, color = inks.quiet)
+                        RunState(run)
                     }
                 }
             }
@@ -112,13 +125,12 @@ private fun Welcome(workspace: Workspace?, runs: List<Run>, onRun: (Run) -> Unit
             }
             Spacer(Modifier.height(19.dp))
             Eyebrow("WORKBENCH", color = inks.pine)
-            Text("Start with a run.", Modifier.padding(top = 8.dp), style = MaterialTheme.typography.headlineLarge)
-            Text("Pick a preset to run in Debian, or open Files to work on your project directly.",
-                Modifier.padding(top = 5.dp), color = inks.quiet, style = MaterialTheme.typography.bodyLarge)
-            if (workspace == null) {
-                Text("Waiting for your workspaces…", Modifier.padding(top = 14.dp), color = inks.quiet,
-                    style = MaterialTheme.typography.bodySmall)
-            }
+            Text("Start with a task.", Modifier.padding(top = 8.dp), style = MaterialTheme.typography.headlineLarge)
+            Text(when {
+                workspace == null -> "Connect to Debian to load your projects."
+                workspace.worktrees -> "Choose a preset for ${workspace.label}. It runs on its own branch, without changing your checkout."
+                else -> "Choose a preset for ${workspace.label}. It runs directly in the project checkout."
+            }, Modifier.padding(top = 5.dp), color = inks.quiet, style = MaterialTheme.typography.bodyLarge)
         }
         if (visible.isNotEmpty()) {
             item { Eyebrow("ACTIVITY", Modifier.padding(top = 31.dp, bottom = 7.dp)); HorizontalDivider(color = inks.rule) }
@@ -139,7 +151,7 @@ private fun Welcome(workspace: Workspace?, runs: List<Run>, onRun: (Run) -> Unit
 }
 
 @Composable
-private fun RunTranscript(api: DaemonApi, run: Run, workspace: String?, onNew: () -> Unit, modifier: Modifier) {
+private fun RunTranscript(api: DaemonApi, run: Run, workspace: String?, modifier: Modifier) {
     var transcript by remember(api, run.id) { mutableStateOf<Transcript?>(null) }
     var error by remember(api, run.id) { mutableStateOf<String?>(null) }
     var follow by rememberSaveable(run.id) { mutableStateOf(true) }
@@ -169,14 +181,9 @@ private fun RunTranscript(api: DaemonApi, run: Run, workspace: String?, onNew: (
         if (follow && chunks.isNotEmpty()) scroll.scrollToItem(chunks.size)
     }
     Column(modifier.fillMaxWidth().padding(start = 21.dp, end = 21.dp, top = 20.dp, bottom = 10.dp)) {
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f)) {
-                Eyebrow("RUN ${run.id}", color = inks.pine)
-                Text(run.label, Modifier.padding(top = 5.dp), style = MaterialTheme.typography.headlineMedium,
-                    maxLines = 2, overflow = TextOverflow.Ellipsis)
-            }
-            GlyphButton(Glyph.Plus, "Open a new run") { onNew() }
-        }
+        Eyebrow(if (run.branch != null) "ISOLATED TASK" else "PROJECT TASK", color = inks.pine)
+        Text(run.label, Modifier.padding(top = 5.dp), style = MaterialTheme.typography.headlineMedium,
+            maxLines = 2, overflow = TextOverflow.Ellipsis)
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             RunState(snapshot?.run ?: run)
             (workspace ?: run.workspace).let {
@@ -225,32 +232,46 @@ private fun RunTranscript(api: DaemonApi, run: Run, workspace: String?, onNew: (
 }
 
 @Composable
-private fun RunDock(
-    workspace: Workspace?, run: Run?, running: Int, capacity: Int, online: Boolean, busy: Boolean,
-    onLaunch: (Preset) -> Unit, onStop: (Run) -> Unit,
+private fun TaskComposer(
+    workspace: Workspace?, title: String, onTitle: (String) -> Unit,
+    running: Int, capacity: Int, online: Boolean, busy: Boolean, onLaunch: (Preset, String) -> Unit,
 ) {
     var presetId by rememberSaveable(workspace?.id) { mutableStateOf<String?>(null) }
     var choices by remember { mutableStateOf(false) }
     val presets = workspace?.presets.orEmpty()
     val preset = presets.firstOrNull { it.id == presetId } ?: presets.firstOrNull()
+    val canLaunch = online && !busy && running < capacity && preset != null
+    val focus = LocalFocusManager.current
     Surface(Modifier.fillMaxWidth().padding(start = 18.dp, end = 18.dp, top = 8.dp, bottom = 12.dp),
         shape = Corner, color = inks.sheet, border = BorderStroke(1.dp, inks.rule)) {
-        Column(Modifier.padding(start = 12.dp, end = 12.dp, bottom = 11.dp)) {
-            Row(Modifier.fillMaxWidth().heightIn(min = 44.dp), verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.padding(horizontal = 12.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 LineIcon(Glyph.Folder, size = 15)
-                Text(workspace?.label ?: "No workspace", Modifier.padding(start = 7.dp).weight(1f),
-                    style = MaterialTheme.typography.bodySmall, color = inks.quiet, maxLines = 1,
+                Text(workspace?.label ?: "No project", Modifier.padding(start = 7.dp).weight(1f),
+                    style = MaterialTheme.typography.labelMedium, color = inks.quiet, maxLines = 1,
                     overflow = TextOverflow.Ellipsis)
-                if (run?.active == true) {
-                    TextButton({ onStop(run) }, enabled = online && !busy && run.state == "running") {
-                        LineIcon(Glyph.Stop, size = 13, color = inks.rust)
-                        Spacer(Modifier.width(5.dp))
-                        Text(if (run.state == "stopping") "Stopping…" else "Stop", color = inks.rust)
-                    }
-                } else {
-                    Text("$running / $capacity running", style = MaterialTheme.typography.bodySmall, color = inks.quiet)
-                }
+                Text("$running / $capacity active", style = MaterialTheme.typography.bodySmall, color = inks.quiet)
             }
+            HorizontalDivider(color = inks.rule)
+            BasicTextField(
+                value = title,
+                onValueChange = { value -> onTitle(value.filter { it >= ' ' && it != '\u007f' }.take(80)) },
+                modifier = Modifier.fillMaxWidth().semantics { contentDescription = "Task name" },
+                enabled = workspace != null && !busy,
+                singleLine = true,
+                textStyle = MaterialTheme.typography.bodyLarge.copy(color = inks.ink),
+                cursorBrush = SolidColor(inks.pine),
+                keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences, imeAction = ImeAction.Done),
+                keyboardActions = KeyboardActions(onDone = { focus.clearFocus() }),
+                decorationBox = { input ->
+                    Box(Modifier.fillMaxWidth().heightIn(min = 42.dp).padding(horizontal = 2.dp),
+                        contentAlignment = Alignment.CenterStart) {
+                        if (title.isEmpty()) Text("Name this task (optional)", color = inks.quiet,
+                            style = MaterialTheme.typography.bodyLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        input()
+                    }
+                },
+            )
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Box(Modifier.weight(1f)) {
                     Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(9.dp)).background(inks.wash)
@@ -267,14 +288,39 @@ private fun RunDock(
                         }
                     }
                 }
-                Button(onClick = { preset?.let(onLaunch) }, enabled = online && !busy && running < capacity && preset != null,
-                    modifier = Modifier.heightIn(min = 46.dp), shape = RoundedCornerShape(9.dp),
+                Button(onClick = {
+                    preset?.let {
+                        focus.clearFocus()
+                        onLaunch(it, title.trim())
+                    }
+                }, enabled = canLaunch, modifier = Modifier.heightIn(min = 46.dp), shape = RoundedCornerShape(9.dp),
                     contentPadding = PaddingValues(horizontal = 15.dp, vertical = 8.dp)) {
-                    Text(if (running >= capacity) "Full" else "Run")
+                    Text(if (busy) "Starting…" else "Start")
                     Spacer(Modifier.width(5.dp))
-                    LineIcon(Glyph.Up, color = if (online && !busy && running < capacity && preset != null) inks.onPine else inks.quiet,
-                        size = 16)
+                    LineIcon(Glyph.Up, color = if (canLaunch) inks.onPine else inks.quiet, size = 16)
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TaskActions(run: Run, online: Boolean, busy: Boolean, onNew: () -> Unit, onStop: (Run) -> Unit) {
+    Surface(Modifier.fillMaxWidth().padding(start = 18.dp, end = 18.dp, top = 8.dp, bottom = 12.dp),
+        shape = Corner, color = inks.sheet, border = BorderStroke(1.dp, inks.rule)) {
+        Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            RunState(run, Modifier.padding(start = 5.dp).weight(1f))
+            if (run.active) {
+                TextButton({ onStop(run) }, enabled = online && !busy && run.state != "stopping") {
+                    LineIcon(Glyph.Stop, size = 13, color = inks.rust)
+                    Spacer(Modifier.width(5.dp))
+                    Text("Stop", color = inks.rust)
+                }
+            }
+            TextButton(onNew, enabled = !busy) {
+                LineIcon(Glyph.Plus, size = 16, color = inks.pine)
+                Spacer(Modifier.width(5.dp))
+                Text("New task")
             }
         }
     }

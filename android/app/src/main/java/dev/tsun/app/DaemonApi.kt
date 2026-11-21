@@ -57,14 +57,16 @@ private class DaemonTrust(fingerprint: String) : X509TrustManager {
 }
 
 internal data class Preset(val id: String, val label: String)
-internal data class Workspace(val id: String, val label: String, val presets: List<Preset>)
+internal data class Workspace(val id: String, val label: String, val worktrees: Boolean, val presets: List<Preset>)
+internal data class FileScope(val workspace: String, val run: String? = null)
 internal data class Entry(val name: String, val directory: Boolean, val size: Long)
 internal data class Listing(val entries: List<Entry>, val truncated: Boolean)
 internal data class Document(val text: String, val revision: String)
 internal data class Run(
     val id: String, val workspace: String, val label: String, val state: String, val exitCode: Int?,
+    val branch: String?, val filesReady: Boolean,
 ) {
-    val active get() = state == "running" || state == "stopping"
+    val active get() = state == "preparing" || state == "running" || state == "stopping"
 }
 internal data class RunList(val items: List<Run>, val capacity: Int)
 internal data class Transcript(val run: Run, val log: String, val truncated: Boolean)
@@ -90,41 +92,41 @@ internal class DaemonApi(private val pairing: Pairing) {
 
     suspend fun catalog(): List<Workspace> {
         val response = json("/v1/workspaces")
-        if (response.getInt("protocol") != 1) throw ApiError(426, "This app needs a daemon using API v1.")
+        if (response.getInt("protocol") != 2) throw ApiError(426, "Rebuild and restart the Tsun 0.2 daemon in Debian.")
         return response.getJSONArray("workspaces").mapObjects { workspace ->
-            Workspace(workspace.getString("id"), workspace.getString("label"),
+            Workspace(workspace.getString("id"), workspace.getString("label"), workspace.getBoolean("worktrees"),
                 workspace.getJSONArray("commands").mapObjects {
                     Preset(it.getString("id"), it.getString("label"))
                 })
         }
     }
 
-    suspend fun entries(workspace: String, path: String): Listing {
-        val response = json(fileRoute("entries", workspace, path))
+    suspend fun entries(scope: FileScope, path: String): Listing {
+        val response = json(fileRoute("entries", scope, path))
         return Listing(response.getJSONArray("entries").mapObjects {
             Entry(it.getString("name"), it.getBoolean("directory"), it.getLong("size"))
         }, response.getBoolean("truncated"))
     }
 
-    suspend fun document(workspace: String, path: String): Document {
-        val response = json(fileRoute("file", workspace, path))
+    suspend fun document(scope: FileScope, path: String): Document {
+        val response = json(fileRoute("file", scope, path))
         return Document(response.getString("text"), response.getString("revision"))
     }
 
-    suspend fun save(workspace: String, path: String, text: String, revision: String): String {
+    suspend fun save(scope: FileScope, path: String, text: String, revision: String): String {
         val bytes = text.toByteArray(Charsets.UTF_8)
         if (bytes.size > 1024 * 1024) throw ApiError(413, "Text editor limit is 1 MiB.")
-        return json(fileRoute("file", workspace, path), "PUT", bytes, "text/plain; charset=utf-8", revision)
+        return json(fileRoute("file", scope, path), "PUT", bytes, "text/plain; charset=utf-8", revision)
             .getString("revision")
     }
 
-    suspend fun image(workspace: String, path: String): ByteArray =
-        request(fileRoute("download", workspace, path)) { input, _ ->
+    suspend fun image(scope: FileScope, path: String): ByteArray =
+        request(fileRoute("download", scope, path)) { input, _ ->
             input.readBounded(12 * 1024 * 1024, "This image is too large to preview. You can still export it.")
         }
 
-    suspend fun export(workspace: String, path: String, openOutput: () -> OutputStream) {
-        request(fileRoute("download", workspace, path)) { input, length ->
+    suspend fun export(scope: FileScope, path: String, openOutput: () -> OutputStream) {
+        request(fileRoute("download", scope, path)) { input, length ->
             if (length !in 0L..(64L * 1024 * 1024)) throw IOException("Invalid artifact size.")
             openOutput().use { output ->
                 val buffer = ByteArray(32 * 1024)
@@ -149,8 +151,8 @@ internal class DaemonApi(private val pairing: Pairing) {
         return Transcript(response.run(), response.getString("log"), response.getBoolean("truncated"))
     }
 
-    suspend fun launch(workspace: String, preset: String): Run = json("/v1/jobs", "POST",
-        JSONObject().put("workspace", workspace).put("command", preset).toString().toByteArray(),
+    suspend fun launch(workspace: String, preset: String, title: String): Run = json("/v1/jobs", "POST",
+        JSONObject().put("workspace", workspace).put("command", preset).put("title", title).toString().toByteArray(),
         "application/json").run()
 
     suspend fun stop(id: String): Run = json("/v1/jobs/${encode(id)}/stop", "POST").run()
@@ -201,13 +203,15 @@ internal class DaemonApi(private val pairing: Pairing) {
     }
 }
 
-private fun fileRoute(endpoint: String, workspace: String, path: String): String =
-    "/v1/$endpoint?workspace=${encode(workspace)}&path=${encode(path)}"
+private fun fileRoute(endpoint: String, scope: FileScope, path: String): String =
+    "/v1/$endpoint?workspace=${encode(scope.workspace)}&path=${encode(path)}" +
+        (scope.run?.let { "&run=${encode(it)}" } ?: "")
 
 private fun encode(value: String): String = URLEncoder.encode(value, "UTF-8")
 
 private fun JSONObject.run(): Run = Run(getString("id"), getString("workspace"), getString("label"),
-    getString("state"), if (isNull("exitCode")) null else getInt("exitCode"))
+    getString("state"), if (isNull("exitCode")) null else getInt("exitCode"),
+    if (isNull("branch")) null else getString("branch"), getBoolean("filesReady"))
 
 private fun <T> JSONArray.mapObjects(transform: (JSONObject) -> T): List<T> =
     List(length()) { transform(getJSONObject(it)) }

@@ -19,6 +19,12 @@ state="$target/state"
 mkdir -- "$state"
 cp -R -- "$repo/examples/workspace" "$target/workspace"
 
+# Worktree tasks branch from a committed snapshot of the demo files.
+git -C "$target/workspace" init -q --initial-branch=main --template=
+git -C "$target/workspace" -c core.hooksPath=/dev/null add -- .
+git -C "$target/workspace" -c core.hooksPath=/dev/null -c commit.gpgsign=false \
+    -c user.name='Tsun Demo' -c user.email='tsun-demo@example.invalid' commit -qm 'Initialize demo workspace'
+
 openssl rand -hex 32 > "$state/token"
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
     -noenc -days 825 -sha256 -subj '/CN=Tsun daemon' \

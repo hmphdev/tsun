@@ -152,6 +152,7 @@ internal fun StatusDot(color: Color, modifier: Modifier = Modifier) {
 @Composable
 internal fun RunState(run: Run, modifier: Modifier = Modifier) {
     val label = when (run.state) {
+        "preparing" -> "Preparing"
         "running" -> "Running"
         "stopping" -> "Stopping"
         "succeeded" -> "Finished"
@@ -160,7 +161,7 @@ internal fun RunState(run: Run, modifier: Modifier = Modifier) {
         else -> "Unknown"
     }
     val color = when (run.state) {
-        "running", "succeeded" -> inks.pine
+        "preparing", "running", "succeeded" -> inks.pine
         "failed" -> inks.rust
         else -> inks.quiet
     }

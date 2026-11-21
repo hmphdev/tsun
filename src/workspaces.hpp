@@ -51,11 +51,16 @@ struct Command {
     std::vector<std::string> argv;
 };
 
+struct FileRoot {
+    Fd directory;
+    std::uintmax_t device;
+};
+
 struct Workspace {
     std::string id;
     std::string label;
-    Fd directory;
-    std::uintmax_t device;
+    FileRoot root;
+    bool worktrees;
     std::vector<Command> commands;
 
     const Command& command(std::string_view id) const;
@@ -67,6 +72,7 @@ struct Configuration {
     std::string token;
     std::string certificate;
     std::string private_key;
+    std::string state_path;
 
     const Workspace& workspace(std::string_view id) const;
     Json catalog() const;
@@ -83,10 +89,11 @@ struct Download {
 };
 
 Configuration load_config(const char* state_path);
-Json list_directory(const Workspace& workspace, std::string_view path);
-TextFile read_text(const Workspace& workspace, std::string_view path);
-std::string write_text(const Workspace& workspace, std::string_view path,
+FileRoot open_file_root(const char* path);
+Json list_directory(const FileRoot& root, std::string_view path);
+TextFile read_text(const FileRoot& root, std::string_view path);
+std::string write_text(const FileRoot& root, std::string_view path,
                        std::string_view text, std::string_view revision);
-Download open_download(const Workspace& workspace, std::string_view path);
+Download open_download(const FileRoot& root, std::string_view path);
 
 } // namespace tsun

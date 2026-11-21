@@ -59,7 +59,7 @@ private val htmlExtensions = setOf("html", "htm")
 
 @Composable
 internal fun FilesScreen(
-    api: DaemonApi, workspace: Workspace, handlesBack: Boolean,
+    api: DaemonApi, scope: FileScope, title: String, branch: String?, handlesBack: Boolean,
     onDirtyChange: (Boolean) -> Unit, onBusyChange: (Boolean) -> Unit, onHome: () -> Unit,
 ) {
     var directory by rememberSaveable { mutableStateOf("") }
@@ -67,7 +67,7 @@ internal fun FilesScreen(
     val file = selected
     if (file != null) {
         key(file) {
-            FilePage(api, workspace.id, file, handlesBack, onDirtyChange, onBusyChange) {
+            FilePage(api, scope, file, handlesBack, onDirtyChange, onBusyChange) {
                 onDirtyChange(false)
                 selected = null
             }
@@ -78,7 +78,7 @@ internal fun FilesScreen(
         }
         BackHandler(enabled = handlesBack, onBack = ::goUp)
         key(directory) {
-            DirectoryPage(api, workspace, directory, ::goUp) { entry ->
+            DirectoryPage(api, scope, title, branch, directory, ::goUp) { entry ->
                 val path = if (directory.isEmpty()) entry.name else "$directory/${entry.name}"
                 if (entry.directory) directory = path else selected = path
             }
@@ -87,27 +87,34 @@ internal fun FilesScreen(
 }
 
 @Composable
-private fun DirectoryPage(api: DaemonApi, workspace: Workspace, path: String, up: () -> Unit,
-                          select: (Entry) -> Unit) {
+private fun DirectoryPage(
+    api: DaemonApi, scope: FileScope, title: String, branch: String?, path: String,
+    up: () -> Unit, select: (Entry) -> Unit,
+) {
     val context = LocalContext.current
     var listing by remember { mutableStateOf<Listing?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
     var refreshing by remember { mutableStateOf(true) }
     var reload by remember { mutableIntStateOf(0) }
-    LaunchedEffect(api, workspace.id, path, reload) {
+    LaunchedEffect(api, scope, path, reload) {
         refreshing = true
         error = null
-        try { listing = api.entries(workspace.id, path) }
+        try { listing = api.entries(scope, path) }
         catch (e: Exception) { error = e.userMessage() }
         finally { refreshing = false }
     }
     Column(Modifier.fillMaxSize().padding(horizontal = 21.dp)) {
-        Eyebrow("WORKSPACE", Modifier.padding(top = 23.dp), color = inks.pine)
-        Text(workspace.label, Modifier.padding(top = 6.dp), style = MaterialTheme.typography.headlineMedium,
+        Eyebrow(if (scope.run != null) "TASK WORKTREE" else "PROJECT CHECKOUT",
+            Modifier.padding(top = 23.dp), color = inks.pine)
+        Text(title, Modifier.padding(top = 6.dp), style = MaterialTheme.typography.headlineMedium,
             maxLines = 2, overflow = TextOverflow.Ellipsis)
+        branch?.let {
+            Text(it, Modifier.padding(top = 4.dp), style = CodeType, color = inks.quiet,
+                maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
         Row(Modifier.fillMaxWidth().padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
             GlyphButton(Glyph.Back, if (path.isEmpty()) "Back to runs" else "Parent folder", onClick = up)
-            Text(path.ifEmpty { "Project root" }, Modifier.weight(1f),
+            Text(path.ifEmpty { if (scope.run != null) "Worktree root" else "Project root" }, Modifier.weight(1f),
                 style = if (path.isEmpty()) MaterialTheme.typography.bodyMedium else CodeType,
                 color = inks.quiet, maxLines = 1, overflow = TextOverflow.Ellipsis)
             GlyphButton(Glyph.Refresh, "Refresh folder", enabled = !refreshing) { reload++ }
@@ -156,7 +163,7 @@ private data class FileMessage(val text: String, val error: Boolean = false)
 
 @Composable
 private fun FilePage(
-    api: DaemonApi, workspace: String, path: String, handlesBack: Boolean,
+    api: DaemonApi, fileScope: FileScope, path: String, handlesBack: Boolean,
     onDirtyChange: (Boolean) -> Unit, onBusyChange: (Boolean) -> Unit, close: () -> Unit,
 ) {
     val name = path.substringAfterLast('/')
@@ -197,7 +204,7 @@ private fun FilePage(
             actionChanged(FileAction.Export)
             scope.launch {
                 try {
-                    api.export(workspace, path) {
+                    api.export(fileScope, path) {
                         resolver.openOutputStream(uri, "w") ?: throw IOException("Couldn't open the save destination.")
                     }
                     message = FileMessage("Exported $name")
@@ -216,7 +223,7 @@ private fun FilePage(
         message = null
         scope.launch {
             try {
-                val revision = api.save(workspace, path, edited, before.revision)
+                val revision = api.save(fileScope, path, edited, before.revision)
                 document = Document(edited, revision)
                 onDirtyChange(false)
                 message = FileMessage("Saved in Debian")
@@ -225,16 +232,16 @@ private fun FilePage(
         }
     }
 
-    LaunchedEffect(api, workspace, path, reload) {
+    LaunchedEffect(api, fileScope, path, reload) {
         loading = true
         loadError = null
         message = null
         document = null
         bitmap = null
         try {
-            if (isImage) bitmap = decodeBitmap(api.image(workspace, path))
+            if (isImage) bitmap = decodeBitmap(api.image(fileScope, path))
             else {
-                val loaded = api.document(workspace, path)
+                val loaded = api.document(fileScope, path)
                 draft = loaded.text
                 document = loaded
                 onDirtyChange(false)

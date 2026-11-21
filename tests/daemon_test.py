@@ -41,6 +41,20 @@ class DaemonTest(unittest.TestCase):
         (self.workspace / "linked-dir").symlink_to(root, target_is_directory=True)
         os.mkfifo(self.workspace / "named-pipe")
 
+        self.repo = root / "git project"
+        self.repo.mkdir()
+        self.git(self.repo, "init", "--quiet", "--initial-branch=main", "--template=")
+        (self.repo / "notes.txt").write_text("committed base\n", encoding="utf-8")
+        self.git(self.repo, "add", "notes.txt")
+        self.git(self.repo, "-c", "user.name=Tsun Test", "-c", "user.email=test@example.invalid",
+                 "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "Test base")
+        (self.repo / "notes.txt").write_text("uncommitted base change\n", encoding="utf-8")
+        unborn = root / "unborn"
+        unborn.mkdir()
+        self.git(unborn, "init", "--quiet", "--initial-branch=main", "--template=")
+        isolated_preset = {"id": "edit", "argv": ["/bin/sh", "-c",
+            "printf 'preset output\\n' > result.txt; pwd; echo ready; exec /bin/sleep 60"]}
+
         self.state = root / "state"
         self.state.mkdir(mode=0o700)
         self.token_file = self.state / "token"
@@ -60,7 +74,7 @@ class DaemonTest(unittest.TestCase):
         config.write_text(json.dumps({
             "port": 0,
             "workspaces": [{
-                "id": "demo", "root": str(self.workspace), "commands": [
+                "id": "demo", "root": str(self.workspace), "worktrees": False, "commands": [
                     {"id": "linger", "argv": ["/bin/sh", "-c", "pwd; echo running; exec /bin/sleep 60"]},
                     {"id": "finish", "argv": ["/bin/sh", "-c", "echo finished; echo stderr >&2; exit 7"]},
                     {"id": "success", "argv": ["/bin/true"]},
@@ -68,6 +82,12 @@ class DaemonTest(unittest.TestCase):
                     {"id": "child", "argv": ["/bin/sh", "-c", "trap '' TERM; /bin/sleep 60 & echo $!; wait"]},
                     {"id": "missing", "argv": ["/no-such-executable-tsun-test"]},
                 ],
+            }, {
+                "id": "isolated", "root": str(self.repo), "commands": [isolated_preset],
+            }, {
+                "id": "unborn", "root": str(unborn), "commands": [isolated_preset],
+            }, {
+                "id": "not-git", "root": str(self.workspace), "commands": [isolated_preset],
             }],
         }), encoding="utf-8")
         self.process = subprocess.Popen(
@@ -81,6 +101,11 @@ class DaemonTest(unittest.TestCase):
         line = self.process.stdout.readline().strip()
         self.assertTrue(line.startswith("Tsun listening on https://127.0.0.1:"), line)
         self.port = int(line.rsplit(":", 1)[1])
+
+    @staticmethod
+    def git(directory, *args):
+        return subprocess.run(["/usr/bin/git", "-C", str(directory), "-c", "core.hooksPath=/dev/null", *args],
+                              check=True, capture_output=True, text=True, timeout=5).stdout.strip()
 
     def shutdown(self):
         if self.process.poll() is None:
@@ -109,12 +134,18 @@ class DaemonTest(unittest.TestCase):
     def api(self, method, path, **options):
         return json.loads(self.request(method, path, **options)[0])
 
-    def file_path(self, endpoint, path=""):
-        return "/v1/" + endpoint + "?" + urlencode({"workspace": "demo", "path": path})
+    def file_path(self, endpoint, path="", *, workspace="demo", run=None):
+        params = {"workspace": workspace, "path": path}
+        if run is not None:
+            params["run"] = run
+        return "/v1/" + endpoint + "?" + urlencode(params)
 
-    def launch(self, command, status=201):
+    def launch(self, command, status=201, *, workspace="demo", title=None):
+        body = {"workspace": workspace, "command": command}
+        if title is not None:
+            body["title"] = title
         return self.api("POST", "/v1/jobs", status=status, headers={"Content-Type": "application/json"},
-                        body=json.dumps({"workspace": "demo", "command": command}))
+                        body=json.dumps(body))
 
     def until(self, job_id, predicate, timeout=5):
         deadline = time.monotonic() + timeout
@@ -134,8 +165,10 @@ class DaemonTest(unittest.TestCase):
         data, headers = self.request("GET", "/v1/workspaces")
         self.assertEqual(headers["Cache-Control"], "no-store")
         catalog = json.loads(data)
-        self.assertEqual(catalog["protocol"], 1)
+        self.assertEqual(catalog["protocol"], 2)
         self.assertEqual(catalog["workspaces"][0]["id"], "demo")
+        self.assertFalse(catalog["workspaces"][0]["worktrees"])
+        self.assertTrue(catalog["workspaces"][1]["worktrees"])
         self.assertNotIn(b"argv", data)
         self.assertNotIn(os.fsencode(self.workspace), data)
         self.api("GET", "/v1/missing", status=404)
@@ -221,6 +254,53 @@ class DaemonTest(unittest.TestCase):
         self.launch("not-allowed", status=404)
         self.assertEqual(self.api("GET", "/v1/jobs/" + second["id"])["state"], "running")
         # Leave this job running to exercise the daemon's shutdown cleanup.
+
+    def test_two_tasks_have_separate_branches_files_and_commands(self):
+        first = self.launch("edit", workspace="isolated", title="  First task  ")
+        second = self.launch("edit", workspace="isolated", title="Second task")
+        self.assertEqual(first["label"], "First task")
+        self.assertEqual(first["state"], "preparing")
+        self.assertFalse(first["filesReady"])
+        self.assertNotEqual(first["branch"], second["branch"])
+        self.launch("edit", status=409, workspace="isolated")
+
+        def path(endpoint, name="", job=None):
+            return self.file_path(endpoint, name, workspace="isolated", run=job and job["id"])
+
+        for index, job in enumerate((first, second), start=1):
+            running = self.until(job["id"], lambda result: "ready\n" in result["log"])
+            self.assertTrue(running["filesReady"])
+            checkout = self.state / "worktrees" / ("isolated-" + job["id"])
+            self.assertIn(str(checkout) + "\n", running["log"])
+            self.assertEqual(self.git(checkout, "branch", "--show-current"), job["branch"])
+            self.assertEqual(self.git(checkout, "rev-parse", "HEAD"), self.git(self.repo, "rev-parse", "HEAD"))
+            self.assertEqual(self.request("GET", path("download", "result.txt", job))[0], b"preset output\n")
+            entries = self.api("GET", path("entries", job=job))["entries"]
+            self.assertEqual({item["name"] for item in entries}, {"notes.txt", "result.txt"})
+            file = path("file", "notes.txt", job)
+            original = self.api("GET", file)
+            self.assertEqual(original["text"], "committed base\n")
+            self.api("PUT", file, headers={"Content-Type": "text/plain", "If-Match": original["revision"]},
+                     body=f"edit in task {index}\n".encode())
+
+        self.api("POST", f"/v1/jobs/{first['id']}/stop")
+        self.until(first["id"], lambda run: run["state"] == "stopped")
+        self.assertEqual(self.api("GET", path("file", "notes.txt", first))["text"], "edit in task 1\n")
+        self.assertEqual(self.api("GET", path("file", "notes.txt", second))["text"], "edit in task 2\n")
+        self.assertEqual(self.api("GET", path("file", "notes.txt"))["text"], "uncommitted base change\n")
+        self.assertFalse((self.repo / "result.txt").exists())
+        self.assertEqual(self.git(self.repo, "branch", "--show-current"), "main")
+        self.api("GET", self.file_path("entries", run=first["id"]), status=404)
+        self.api("GET", self.file_path("file", "notes.txt", workspace="isolated", run="f" * 24), status=404)
+
+    def test_isolation_fails_closed_without_a_committed_git_root(self):
+        self.launch("edit", status=409, workspace="not-git")
+        self.launch("edit", status=400, workspace="isolated", title="two\nlines")
+        job = self.launch("edit", workspace="unborn")
+        failed = self.until(job["id"], lambda result: result["state"] == "failed")
+        self.assertFalse(failed["filesReady"])
+        self.assertIn("The preset did not run", failed["log"])
+        self.api("GET", self.file_path("entries", workspace="unborn", run=job["id"]), status=409)
 
     def test_log_limit_and_process_group_stop(self):
         flooded = self.until(self.launch("flood")["id"], lambda job: job["state"] == "succeeded")
