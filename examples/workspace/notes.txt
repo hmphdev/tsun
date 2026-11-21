@@ -1,0 +1,10 @@
+FIELD NOTES
+A Tsun demo workspace, stored in Debian.
+
+Edit this line in the app, tap Save, and reopen the file from your shell.
+
+Try starting Demo report and Demo checks together. They keep running when
+you switch between them or close the app. Stop ends the selected run.
+
+Open artifacts/report.html for the offline HTML view, or artifacts/field.png
+for an image you can zoom or export with Android’s save picker.

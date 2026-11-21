@@ -1,0 +1,22 @@
+{
+  "port": 8787,
+  "workspaces": [
+    {
+      "id": "field-notes",
+      "label": "Field Notes",
+      "root": "/absolute/path/to/your/debian/project",
+      "commands": [
+        {
+          "id": "report",
+          "label": "Demo report",
+          "argv": ["/bin/sh", "-c", "printf 'Workspace: %s\\n' \"$PWD\"; for step in indexing gathering formatting rendering; do printf 'Report: %s\\n' \"$step\"; /bin/sleep 8; done; printf 'Open artifacts/report.html in Files.\\n'"]
+        },
+        {
+          "id": "check",
+          "label": "Demo checks",
+          "argv": ["/bin/sh", "-c", "for step in files preview export; do printf 'Checking %s…\\n' \"$step\"; /bin/sleep 10; done; printf 'Demo checks complete.\\n'"]
+        }
+      ]
+    }
+  ]
+}
