@@ -146,7 +146,8 @@ internal fun ThreadScreen(
     }
 
     val current = thread
-    val provider = providers.firstOrNull { it.id == (providerId ?: current?.provider) }
+    val canSteer = current?.canSteer == true
+    val provider = providers.firstOrNull { it.id == (providerId?.takeUnless { current?.active == true } ?: current?.provider) }
     fun act(block: suspend () -> AgentThread) {
         if (busy) return
         busy = true
@@ -172,15 +173,20 @@ internal fun ThreadScreen(
         }
         Composer(
             draft = draft,
-            placeholder = if (current?.active == true) "The agent is working…" else "Reply…",
+            placeholder = when {
+                canSteer -> "Steer the next reply…"
+                current?.active == true -> "The agent is working…"
+                else -> "Reply…"
+            },
             mode = current?.mode ?: Mode.Edits,
             onMode = { mode -> act { api.setMode(threadId, mode).also { onMode(it.mode) } } },
             providers = providers, provider = provider, onProvider = { providerId = it.id },
             working = current?.active == true, canSend = current != null && provider?.enabled != false, busy = busy,
+            canSteer = canSteer,
             onSend = { text ->
-                val switch = providerId?.takeIf { it != current?.provider }
+                val switch = providerId?.takeIf { !canSteer && it != current?.provider }
                 act {
-                    api.reply(threadId, text, switch).also { draft.clearText() }
+                    api.reply(threadId, text, provider = switch, steer = canSteer).also { draft.clearText() }
                 }
             },
             onStop = { act { api.interrupt(threadId) } },
@@ -271,7 +277,7 @@ private fun Conversation(
             if (!loaded) item { Text("Loading…", color = inks.faint, style = MaterialTheme.typography.bodyMedium) }
             items(entries, key = { it.id }) { row ->
                 when (val entry = row.entry.value) {
-                    is ThreadItem.User -> UserTurn(entry.text)
+                    is ThreadItem.User -> UserTurn(entry)
                     is ThreadItem.Text -> if (entry.text.isNotBlank()) {
                         SelectionContainer { MarkdownText(entry.text, Modifier.fillMaxWidth()) }
                     }
@@ -295,13 +301,21 @@ private fun Conversation(
 }
 
 @Composable
-private fun UserTurn(text: String) {
-    Box(Modifier.fillMaxWidth().padding(top = 6.dp), contentAlignment = Alignment.CenterEnd) {
+private fun UserTurn(entry: ThreadItem.User) {
+    Column(Modifier.fillMaxWidth().padding(top = 6.dp), horizontalAlignment = Alignment.End) {
         SelectionContainer {
-            Text(text, Modifier.widthIn(max = 560.dp).clip(RoundedCornerShape(18.dp, 18.dp, 6.dp, 18.dp))
+            Text(entry.text, Modifier.widthIn(max = 560.dp).clip(RoundedCornerShape(18.dp, 18.dp, 6.dp, 18.dp))
                 .background(inks.raised).border(1.dp, inks.rule, RoundedCornerShape(18.dp, 18.dp, 6.dp, 18.dp))
                 .padding(horizontal = 15.dp, vertical = 11.dp), style = MaterialTheme.typography.bodyLarge, color = inks.ink)
         }
+        val status = when (entry.steering) {
+            "queued" -> "Queued for the next reply"
+            "sent" -> "Steering sent"
+            "cancelled" -> "Steering not sent"
+            else -> null
+        }
+        if (status != null) Text(status, Modifier.padding(top = 3.dp, end = 4.dp),
+            style = MaterialTheme.typography.labelSmall, color = inks.quiet)
     }
 }
 

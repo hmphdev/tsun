@@ -21,6 +21,7 @@ using namespace std::chrono_literals;
 constexpr std::size_t max_active = 3;
 constexpr std::size_t max_threads = 24;
 constexpr int max_steps = 120;
+constexpr std::size_t max_pending_steering = 8;
 constexpr std::size_t prompt_limit = 64 * 1024;
 
 std::string random_id() {
@@ -76,6 +77,10 @@ std::string checked_mode(const std::string& mode) {
 }
 
 const std::set<std::string> effort_levels{"minimal", "low", "medium", "high", "xhigh", "max"};
+
+bool is_effort_command(const std::string& text) {
+    return text.rfind("/effort", 0) == 0 && (text.size() == 7 || static_cast<unsigned char>(text[7]) <= ' ');
+}
 
 std::string first_line(const std::string& text) {
     return trimmed(text.substr(0, text.find('\n')));
@@ -263,6 +268,7 @@ struct Agents::Thread {
     std::vector<Turn> history;
     std::vector<Json> items;
     std::map<std::string, std::size_t> index;
+    std::vector<std::string> steering; // item IDs, in order of receipt; guarded by mutex_
     std::uint64_t rev = 0, next_item = 0;
     int runs = 0;
     std::string pending_call;
@@ -526,6 +532,7 @@ Json Agents::summary(const Thread& thread) const {
         {"model", provider ? provider->settings().model : ""},
         {"branch", thread.branch.empty() ? Json(nullptr) : Json(thread.branch)},
         {"filesReady", bool(thread.root)}, {"runs", thread.runs},
+        {"canSteer", thread.active() && !thread.peer && !thread.cancel},
         {"pendingCall", thread.pending_call.empty() ? Json(nullptr) : Json(thread.pending_call)},
         {"additions", thread.additions}, {"deletions", thread.deletions}, {"filesChanged", thread.files_changed},
         {"copiedFiles", thread.copied_files}, {"copiedLines", thread.copied_lines},
@@ -596,15 +603,19 @@ Json Agents::create(const Workspace& workspace, const Json& body) {
     return created;
 }
 
+void Agents::begin_run(Thread& thread) {
+    ++thread.runs;
+    thread.cancel = false;
+    thread.error.clear();
+    thread.run_writes.clear();
+    thread.state = thread.root ? "running" : "preparing";
+}
+
 void Agents::start_run(const std::shared_ptr<Thread>& thread, std::string prompt, std::shared_ptr<PeerRequest> peer) {
     // Called with mutex_ held and the thread idle.
     if (thread->worker.joinable()) thread->worker.join();
-    ++thread->runs;
-    thread->cancel = false;
-    thread->error.clear();
-    thread->run_writes.clear();
+    begin_run(*thread);
     thread->peer = std::move(peer);
-    thread->state = thread->root ? "running" : "preparing";
     if (thread->peer) {
         thread->peer->history_size = thread->history.size();
         const auto prefix = "Message from session " + thread->peer->source_id + " (read-only question):\n";
@@ -667,7 +678,22 @@ Json Agents::send(std::string_view id, const Json& body) {
     const std::lock_guard lock(mutex_);
     if (shutting_down_) throw Error(503, "Daemon is shutting down");
     const auto thread = find(id);
-    if (thread->active()) throw Error(409, "The agent is still working; wait or stop it first");
+    const auto steer = body.find("steer");
+    if (steer != body.end() && !steer->is_boolean()) throw Error(400, "Steer must be a boolean");
+    const bool steering = steer != body.end() && steer->get<bool>();
+    if (steering && (body.contains("mode") || body.contains("provider"))) {
+        throw Error(400, "Steering cannot change the model or permission mode");
+    }
+    if (thread->active()) {
+        if (!steering) throw Error(409, "The agent is still working; wait or stop it first");
+        if (thread->peer) throw Error(409, "Wait for the read-only session message to finish before replying");
+        if (thread->cancel) throw Error(409, "The agent is stopping; wait before replying");
+        if (is_effort_command(text)) throw Error(409, "Wait for the run to finish before using /effort");
+        if (thread->steering.size() >= max_pending_steering) throw Error(409, "Too many steering messages are queued");
+        thread->steering.push_back(add_item(*thread, {{"kind", "user"}, {"text", std::move(text)},
+            {"steering", "queued"}})["id"].get<std::string>());
+        return summary(*thread);
+    }
     const auto active = std::count_if(threads_.begin(), threads_.end(), [](const auto& t) { return t->active(); });
     if (static_cast<std::size_t>(active) >= max_active) throw Error(409, "Three agent threads are already working");
     if (body.contains("mode")) thread->mode = checked_mode(body["mode"].get<std::string>());
@@ -689,10 +715,8 @@ Json Agents::send(std::string_view id, const Json& body) {
 
 bool Agents::effort_command(Thread& thread, const std::string& text) {
     // Called with mutex_ held and the thread idle.
-    if (text.rfind("/effort", 0) != 0) return false;
-    const auto rest = text.substr(7);
-    if (!rest.empty() && static_cast<unsigned char>(rest[0]) > ' ') return false; // /effort… is a message
-    const auto level = trimmed(rest);
+    if (!is_effort_command(text)) return false;
+    const auto level = trimmed(text.substr(7));
     const auto* provider = providers_.find(thread.provider_id);
     const auto configured = provider ? provider->settings().effort : std::string{};
     const auto current = thread.effort.empty() ? configured : thread.effort;
@@ -750,8 +774,13 @@ Json Agents::update(std::string_view id, const Json& body) {
 Json Agents::interrupt(std::string_view id) {
     const std::lock_guard lock(mutex_);
     const auto thread = find(id);
-    if (thread->active()) thread->cancel = true;
-    changed_.notify_all();
+    if (thread->active() && !thread->cancel) {
+        thread->cancel = true;
+        resolve_steering(*thread, false);
+        ++thread->rev;
+        thread->updated_at = now_ms();
+        changed_.notify_all();
+    }
     return summary(*thread);
 }
 
@@ -813,27 +842,39 @@ Json Agents::diff(std::string_view id) const {
 
 // ---- The agent loop ----------------------------------------------------------
 
+void Agents::resolve_steering(Thread& thread, bool deliver) {
+    // Called with mutex_ held, at a request boundary or when discarding the queue.
+    for (const auto& id : thread.steering) {
+        auto& entry = *item(thread, id);
+        if (deliver) {
+            thread.history.push_back({Turn::Role::User, entry["text"].get<std::string>(), {}, {}, {}, {}});
+            entry["run"] = thread.runs;
+        }
+        entry["steering"] = deliver ? "sent" : "cancelled";
+        touch(thread, entry);
+    }
+    thread.steering.clear();
+}
+
 void Agents::work(std::shared_ptr<Thread> thread) {
-    const auto started = std::chrono::steady_clock::now();
-    int run = 0;
-    {
-        const std::lock_guard lock(mutex_);
-        run = thread->runs;
-    }
-    try {
-        if (prepare(*thread)) run_steps(*thread);
-    } catch (const std::exception& error) {
-        const std::lock_guard lock(mutex_);
-        thread->error = error.what();
-        add_item(*thread, {{"kind", "notice"}, {"tone", "error"}, {"text", std::string("Tsun: ") + error.what()}});
-    }
-    try {
-        if (!thread->peer) checkpoint(*thread, run, started);
-    } catch (const std::exception& error) {
-        const std::lock_guard lock(mutex_);
-        add_item(*thread, {{"kind", "notice"}, {"tone", "error"}, {"text", std::string("Checkpoint failed: ") + error.what()}});
-    }
-    Json snapshot;
+    for (;;) {
+        const auto started = std::chrono::steady_clock::now();
+        bool completed = false;
+        try {
+            if (prepare(*thread)) completed = run_steps(*thread);
+        } catch (const std::exception& error) {
+            const std::lock_guard lock(mutex_);
+            thread->error = error.what();
+            add_item(*thread, {{"kind", "notice"}, {"tone", "error"}, {"text", std::string("Tsun: ") + error.what()}});
+        }
+        try {
+            if (!thread->peer) checkpoint(*thread, thread->runs, started);
+        } catch (const std::exception& error) {
+            const std::lock_guard lock(mutex_);
+            add_item(*thread, {{"kind", "notice"}, {"tone", "error"}, {"text", std::string("Checkpoint failed: ") + error.what()}});
+        }
+        Json snapshot;
+        bool follow_up = false;
     {
         const std::lock_guard lock(mutex_);
         if (const auto peer = std::exchange(thread->peer, {})) {
@@ -845,9 +886,16 @@ void Agents::work(std::shared_ptr<Thread> thread) {
             else peer->outcome = {"Reply from session " + thread->id + ":\n" + peer->answer, false};
             peer->done = true;
         }
-        thread->state = "idle";
         thread->pending_call.clear();
         thread->decision.clear();
+        // A reply can finish without another tool step. Deliver any remaining
+        // steering as a follow-up run on this same worker, without going idle.
+        follow_up = completed && !thread->cancel && !shutting_down_ && !thread->steering.empty();
+        if (follow_up) begin_run(*thread);
+        else {
+            resolve_steering(*thread, false);
+            thread->state = "idle";
+        }
         ++thread->rev;
         thread->updated_at = now_ms();
         snapshot = document(*thread);
@@ -856,8 +904,10 @@ void Agents::work(std::shared_ptr<Thread> thread) {
         thread->saved_state = thread->state;
         changed_.notify_all();
     }
-    // Persist the finished run before the worker goes away, so a restart keeps the transcript.
+    // Persist the run boundary before the worker moves on, so a restart keeps the transcript.
     save_thread(snapshot);
+    if (!follow_up) return;
+    }
 }
 
 bool Agents::prepare(Thread& thread) {
@@ -904,7 +954,7 @@ bool Agents::prepare(Thread& thread) {
     return true;
 }
 
-void Agents::run_steps(Thread& thread) {
+bool Agents::run_steps(Thread& thread) {
     const auto& root = *thread.root;
     const auto& root_path = thread.root_path;
     const auto guidance = thread.cancel ? std::string{} : workspace_guidance(root);
@@ -917,6 +967,7 @@ void Agents::run_steps(Thread& thread) {
     const auto& tools = peer ? inspection_tools() : agent_tools();
     int remaining_delegates = 2;
     int remaining_messages = 2;
+    bool completed = false;
     for (int step = 0; step < (peer ? 8 : max_steps); ++step) {
         std::vector<Turn> history;
         const Provider* provider = nullptr;
@@ -924,6 +975,7 @@ void Agents::run_steps(Thread& thread) {
         {
             const std::lock_guard lock(mutex_);
             if (thread.cancel) break;
+            resolve_steering(thread, true);
             provider = providers_.find(thread.provider_id);
             history = thread.history;
             effort = thread.effort;
@@ -1029,6 +1081,7 @@ void Agents::run_steps(Thread& thread) {
             }
         }
         if (calls.empty() || reply.stop == StopReason::Refusal) {
+            completed = reply.stop != StopReason::Refusal;
             if (peer && reply.stop == StopReason::End) {
                 constexpr std::size_t limit = 8192;
                 auto size = std::min(reply.turn.text.size(), limit);
@@ -1059,9 +1112,16 @@ void Agents::run_steps(Thread& thread) {
                     touch(thread, *entry);
                 }
             };
+            const auto skip_for_steering = [&] {
+                result.content = "Skipped because the user sent a steering message before this call ran.";
+                if (auto* entry = item(thread, item_id)) (*entry)["output"] = result.content;
+                set_status("cancelled");
+            };
             if (thread.cancel) {
                 result.content = "Interrupted by the user before this call ran.";
                 set_status("cancelled");
+            } else if (!thread.steering.empty()) {
+                skip_for_steering();
             } else if (rejection || (call.name == "delegate_task" && remaining_delegates == 0) ||
                        (call.name == "message_session" && remaining_messages == 0)) {
                 result.content = rejection ? *rejection : call.name == "delegate_task" ?
@@ -1079,15 +1139,18 @@ void Agents::run_steps(Thread& thread) {
                     thread.pending_call = item_id;
                     thread.decision.clear();
                     set_status("waiting");
-                    changed_.wait(lock, [&] { return !thread.decision.empty() || thread.cancel.load(); });
-                    allowed = thread.decision == "allow" && !thread.cancel;
+                    changed_.wait(lock, [&] { return !thread.decision.empty() || thread.cancel || !thread.steering.empty(); });
+                    allowed = thread.decision == "allow" && !thread.cancel && thread.steering.empty();
                     thread.pending_call.clear();
                     thread.decision.clear();
                     thread.state = "running";
                 }
                 if (!allowed) {
-                    result.content = thread.cancel ? "Interrupted by the user." : "The user declined this action. Ask how they want to proceed, or try another approach.";
-                    set_status(thread.cancel ? "cancelled" : "denied");
+                    if (!thread.cancel && !thread.steering.empty()) skip_for_steering();
+                    else {
+                        result.content = thread.cancel ? "Interrupted by the user." : "The user declined this action. Ask how they want to proceed, or try another approach.";
+                        set_status(thread.cancel ? "cancelled" : "denied");
+                    }
                 } else {
                     set_status("running");
                     lock.unlock();
@@ -1123,6 +1186,7 @@ void Agents::run_steps(Thread& thread) {
     }
     const std::lock_guard lock(mutex_);
     if (thread.cancel) add_item(thread, {{"kind", "notice"}, {"tone", "info"}, {"text", "Stopped."}});
+    return completed;
 }
 
 void Agents::checkpoint(Thread& thread, int run, std::chrono::steady_clock::time_point started) {

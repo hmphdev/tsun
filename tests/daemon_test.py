@@ -700,6 +700,134 @@ class DaemonTest(unittest.TestCase):
         thread, items = self.thread_until(thread_id, lambda t, _: t["effort"] is None)
         self.assertIn("reset to the provider default", [e["text"] for e in items if e["kind"] == "notice"][-1])
 
+    def test_steering_replaces_an_unapproved_tool_plan(self):
+        self.model.script += [
+            anthropic_stream([
+                {"type": "thinking", "thinking": "Plan: write a file.", "signature": "sig-steer"},
+                {"type": "tool_use", "id": "toolu_write", "name": "write_file",
+                 "input": {"path": "steered.txt", "content": "do not write"}},
+                {"type": "tool_use", "id": "toolu_list", "name": "list_files", "input": {}},
+            ], "tool_use"),
+            anthropic_stream([{"type": "text", "text": "I will explain instead."}], "end_turn"),
+        ]
+        thread_id = self.post("/v1/threads", {"workspace": "demo", "prompt": "Write a file", "mode": "ask"}, 201)["id"]
+        route = f"/v1/threads/{thread_id}"
+        waiting, _ = self.thread_until(thread_id, lambda t, _: t["state"] == "waiting")
+        self.assertTrue(waiting["canSteer"])
+        self.post(route + "/messages", {"text": "Plain reply"}, 409)
+        self.post(route + "/messages", {"text": "/effort low", "steer": True}, 409)
+        self.post(route + "/messages", {"text": "Switch", "steer": True, "provider": "local"}, 400)
+        self.post(route + "/messages", {"text": "Allow", "steer": True, "mode": "full"}, 400)
+        self.post(route + "/messages", {"text": "Explain instead", "steer": True}, 202)
+
+        thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle")
+        self.assertEqual((thread["runs"], thread["mode"], thread["provider"], thread["pendingCall"]), (1, "ask", "claude", None))
+        self.post(route + "/approval", {"call": waiting["pendingCall"], "decision": "allow"}, 409)
+        self.assertFalse((self.workspace / "steered.txt").exists())
+        self.assertEqual([e["status"] for e in items if e["kind"] == "tool"], ["cancelled", "cancelled"])
+        message = next(e for e in items if e.get("steering") == "sent")
+        self.assertEqual((message["run"], message["text"]), (1, "Explain instead"))
+        messages = self.model.requests[1]["body"]["messages"]
+        self.assertEqual(messages[-2]["content"][0]["signature"], "sig-steer")
+        first, second, text = messages[-1]["content"]
+        self.assertEqual([(b["type"], b["tool_use_id"], b["is_error"]) for b in (first, second)],
+                         [("tool_result", "toolu_write", True), ("tool_result", "toolu_list", True)])
+        self.assertEqual(text, {"type": "text", "text": "Explain instead"})
+
+    def test_steering_after_a_final_reply_starts_a_followup_in_order(self):
+        started, release = threading.Event(), threading.Event()
+
+        def final_reply(_body):
+            started.set()
+            release.wait(8)
+            return openai_stream(content="The first reply.")
+
+        self.addCleanup(release.set)
+        self.model.script += [final_reply, openai_stream(content="The steered reply."), openai_stream(content="OK.")]
+        thread_id = self.post("/v1/threads", {"workspace": "demo", "provider": "local", "prompt": "First"}, 201)["id"]
+        route = f"/v1/threads/{thread_id}"
+        self.assertTrue(started.wait(3))
+        for text in ("Second", "Third"):
+            self.post(route + "/messages", {"text": text, "steer": True}, 202)
+        page = self.api("GET", route)
+        queued = [e for e in page["items"] if e.get("steering") == "queued"]
+        self.assertEqual([e["text"] for e in queued], ["Second", "Third"])
+        release.set()
+
+        thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle")
+        self.assertEqual(thread["runs"], 2)
+        self.assertFalse(thread["canSteer"])
+        self.assertEqual([e["run"] for e in items if e["kind"] == "run"], [1, 2])
+        sent = [e for e in items if e.get("steering") == "sent"]
+        self.assertEqual([(e["id"], e["run"]) for e in sent], [(e["id"], 2) for e in queued])
+        messages = self.model.requests[1]["body"]["messages"]
+        self.assertEqual(messages[-3:], [
+            {"role": "assistant", "content": "The first reply."},
+            {"role": "user", "content": "Second"},
+            {"role": "user", "content": "Third"},
+        ])
+
+        # A steer racing with an idle transition becomes an ordinary reply.
+        self.post(route + "/messages", {"text": "Fourth", "steer": True}, 202)
+        thread, _ = self.thread_until(thread_id, lambda t, _: t["state"] == "idle")
+        self.assertEqual(thread["runs"], 3)
+        self.assertEqual(self.model.requests[2]["body"]["messages"][-1], {"role": "user", "content": "Fourth"})
+
+    def test_steering_leaves_the_running_tool_alone(self):
+        self.model.script += [
+            openai_stream(calls=[
+                ("running", "bash", {"command": "until test -f release-tool; do sleep 0.03; done; echo finished",
+                                      "timeout_seconds": 10}),
+                ("queued", "write_file", {"path": "steered.txt", "content": "do not write"}),
+            ], finish="tool_calls"),
+            openai_stream(content="I will stop editing."),
+        ]
+        thread_id = self.post("/v1/threads", {"workspace": "demo", "provider": "local", "mode": "full",
+                              "prompt": "Make a file after the command"}, 201)["id"]
+        self.thread_until(thread_id, lambda _, i: any(e.get("call") == "running" and e["status"] == "running" for e in i))
+        route = f"/v1/threads/{thread_id}"
+        self.post(route + "/messages", {"text": "No more edits", "steer": True}, 202)
+        self.assertEqual(len(self.model.requests), 1)
+        (self.workspace / "release-tool").touch()
+
+        thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle")
+        self.assertEqual(thread["runs"], 1)
+        self.assertEqual([e["status"] for e in items if e["kind"] == "tool"], ["done", "cancelled"])
+        self.assertFalse((self.workspace / "steered.txt").exists())
+        messages = self.model.requests[1]["body"]["messages"]
+        self.assertEqual([m["role"] for m in messages[-4:]], ["assistant", "tool", "tool", "user"])
+        self.assertEqual([m["tool_call_id"] for m in messages[-3:-1]], ["running", "queued"])
+        self.assertIn("finished", messages[-3]["content"])
+        self.assertIn("Skipped", messages[-2]["content"])
+        self.assertEqual(messages[-1], {"role": "user", "content": "No more edits"})
+
+    def test_stop_discards_unsent_steering(self):
+        started = threading.Event()
+
+        def hang(body):
+            started.set()
+            return self.model.hang(body)
+
+        self.model.script += [hang, openai_stream(content="OK.")]
+        thread_id = self.post("/v1/threads", {"workspace": "demo", "provider": "local", "prompt": "Wait"}, 201)["id"]
+        route = f"/v1/threads/{thread_id}"
+        self.assertTrue(started.wait(3))
+        for n in range(8):
+            self.post(route + "/messages", {"text": f"Discard me {n}", "steer": True}, 202)
+        self.post(route + "/messages", {"text": "Too many", "steer": True}, 409)
+        rev = self.api("GET", route)["rev"]
+        stopped = self.post(route + "/interrupt", {})
+        self.assertFalse(stopped["canSteer"])
+        thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle")
+        self.assertEqual(thread["runs"], 1)
+        self.assertEqual(len(self.model.requests), 1)
+        updated = self.api("GET", route + f"?since={rev}")["items"]
+        self.assertEqual([e["steering"] for e in updated if e.get("steering")], ["cancelled"] * 8)
+        self.assertTrue(items[-1]["stopped"])
+        self.post(route + "/messages", {"text": "Try again"}, 202)
+        self.thread_until(thread_id, lambda t, _: t["state"] == "idle")
+        self.assertNotIn("Discard me", json.dumps(self.model.requests[-1]["body"]["messages"]))
+
     def test_agent_denials_confinement_and_interrupt(self):
         self.model.script += [
             anthropic_stream([
@@ -959,6 +1087,9 @@ class DaemonTest(unittest.TestCase):
         while len(self.model.requests) < 3:
             self.assertLess(time.monotonic(), deadline, "the target model was never called")
             time.sleep(0.02)
+        target_route = f"/v1/threads/{target_id}"
+        self.assertFalse(self.api("GET", target_route)["thread"]["canSteer"])
+        self.post(target_route + "/messages", {"text": "Redirect the peer", "steer": True}, 409)
         self.post(f"/v1/threads/{source_id}/interrupt", {})
         source, items = self.thread_until(source_id, lambda t, _: t["state"] == "idle", timeout=5)
         target, target_items = self.thread_until(target_id, lambda t, _: t["state"] == "idle", timeout=5)

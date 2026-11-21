@@ -95,7 +95,7 @@ internal data class AgentThread(
     val id: String, val workspace: String, val title: String, val state: String, val mode: Mode,
     val provider: String, val providerLabel: String, val model: String, val branch: String?, val filesReady: Boolean,
     val runs: Int, val pendingCall: String?, val additions: Int, val deletions: Int, val filesChanged: Int,
-    val error: String?,
+    val error: String?, val canSteer: Boolean,
 ) {
     val active get() = state != "idle"
 }
@@ -106,7 +106,7 @@ internal sealed interface ThreadItem {
     val id: String
     val run: Int
 
-    data class User(override val id: String, override val run: Int, val text: String) : ThreadItem
+    data class User(override val id: String, override val run: Int, val text: String, val steering: String?) : ThreadItem
     data class Text(override val id: String, override val run: Int, val text: String, val streaming: Boolean) : ThreadItem
     data class Thinking(override val id: String, override val run: Int, val text: String, val streaming: Boolean) : ThreadItem
     data class Tool(
@@ -188,9 +188,11 @@ internal class DaemonApi(private val pairing: Pairing) {
         post("/v1/threads", JSONObject().put("workspace", workspace).put("prompt", prompt).put("mode", mode.wire)
             .apply { if (provider != null) put("provider", provider) }).thread()
 
-    suspend fun reply(id: String, text: String, provider: String?): AgentThread =
-        post("/v1/threads/${encode(id)}/messages", JSONObject().put("text", text)
-            .apply { if (provider != null) put("provider", provider) }).thread()
+    suspend fun reply(id: String, text: String, provider: String? = null, steer: Boolean = false): AgentThread =
+        post("/v1/threads/${encode(id)}/messages", JSONObject().put("text", text).apply {
+            if (steer) put("steer", true)
+            if (provider != null) put("provider", provider)
+        }).thread()
 
     suspend fun setMode(id: String, mode: Mode): AgentThread =
         post("/v1/threads/${encode(id)}/settings", JSONObject().put("mode", mode.wire)).thread()
@@ -332,6 +334,7 @@ private fun JSONObject.thread(): AgentThread = AgentThread(
     model = getString("model"), branch = optStringOrNull("branch"), filesReady = getBoolean("filesReady"),
     runs = getInt("runs"), pendingCall = optStringOrNull("pendingCall"), additions = getInt("additions"),
     deletions = getInt("deletions"), filesChanged = getInt("filesChanged"), error = optStringOrNull("error"),
+    canSteer = optBoolean("canSteer"),
 )
 
 private fun JSONObject.fileStat() = FileStat(getString("path"), getInt("additions"), getInt("deletions"), optBoolean("binary"))
@@ -340,7 +343,7 @@ private fun JSONObject.threadItem(): ThreadItem? {
     val id = getString("id")
     val run = optInt("run")
     return when (getString("kind")) {
-        "user" -> ThreadItem.User(id, run, getString("text"))
+        "user" -> ThreadItem.User(id, run, getString("text"), optStringOrNull("steering"))
         "text" -> ThreadItem.Text(id, run, getString("text"), optBoolean("streaming"))
         "thinking" -> ThreadItem.Thinking(id, run, getString("text"), optBoolean("streaming"))
         "tool" -> ThreadItem.Tool(id, run, optString("name"), optString("title"), optString("detail"),

@@ -14,7 +14,7 @@
 namespace tsun {
 
 // Agent threads, modeled on T3 Code's orchestration: an app thread holds runs
-// (one per user message); a run holds items (text, reasoning, tool calls,
+// (started by user messages); a run holds items (text, reasoning, tool calls,
 // approvals, notices). Every change bumps the thread's revision, and clients
 // catch up with `since=<rev>` instead of re-reading the whole conversation.
 class Agents {
@@ -42,10 +42,12 @@ private:
 
     std::shared_ptr<Thread> find(std::string_view id) const;
     bool effort_command(Thread& thread, const std::string& text);
+    void begin_run(Thread& thread);
     void start_run(const std::shared_ptr<Thread>& thread, std::string prompt, std::shared_ptr<PeerRequest> peer = {});
     ToolOutcome message_session(Thread& source, const ToolCall& call);
     void work(std::shared_ptr<Thread> thread);
-    void run_steps(Thread& thread);
+    bool run_steps(Thread& thread);
+    void resolve_steering(Thread& thread, bool deliver);
     bool prepare(Thread& thread);
     void checkpoint(Thread& thread, int run, std::chrono::steady_clock::time_point started);
     Json summary(const Thread& thread) const;

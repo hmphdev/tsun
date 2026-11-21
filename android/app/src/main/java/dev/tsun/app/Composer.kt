@@ -44,7 +44,7 @@ internal const val MessageLimit = 32_000
 
 /**
  * The rounded message box at the bottom of every conversation: text first, then a
- * row of quiet chips (permission mode, model) and one round action on the right.
+ * row of quiet chips (permission mode, model) and the send/stop actions on the right.
  */
 @Composable
 internal fun Composer(
@@ -61,6 +61,7 @@ internal fun Composer(
     onSend: (String) -> Unit,
     onStop: () -> Unit,
     modifier: Modifier = Modifier,
+    canSteer: Boolean = false,
     leading: @Composable RowScope.() -> Unit = {},
 ) {
     Surface(modifier.fillMaxWidth(), shape = RoundedCornerShape(22.dp), color = inks.raised,
@@ -95,8 +96,12 @@ internal fun Composer(
                 }
                 Spacer(Modifier.width(8.dp))
                 if (working) RoundAction(Glyph.Stop, "Stop the agent", enabled = !busy, filled = false, onClick = onStop)
-                else RoundAction(Glyph.Up, "Send", enabled = canSend && !busy && hasText, filled = true) {
-                    onSend(draft.text.toString().trim())
+                if (!working || canSteer) {
+                    if (working) Spacer(Modifier.width(6.dp))
+                    RoundAction(Glyph.Up, if (working) "Steer the agent" else "Send",
+                        enabled = canSend && !busy && hasText, filled = true) {
+                        onSend(draft.text.toString().trim())
+                    }
                 }
             }
         }
