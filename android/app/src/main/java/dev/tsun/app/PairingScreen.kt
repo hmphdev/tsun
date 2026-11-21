@@ -37,7 +37,7 @@ import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 
 @Composable
-internal fun PairingScreen(onPair: (Pairing, List<Workspace>) -> Unit) {
+internal fun PairingScreen(onPair: (Pairing, Catalog) -> Unit) {
     // Don't put the unsubmitted code in Activity saved state.
     var code by remember { mutableStateOf("") }
     var connecting by remember { mutableStateOf(false) }
@@ -52,7 +52,7 @@ internal fun PairingScreen(onPair: (Pairing, List<Workspace>) -> Unit) {
                 Text("Tsun", style = MaterialTheme.typography.headlineSmall)
             }
             Spacer(Modifier.height(39.dp))
-            Eyebrow("LOCAL WORKBENCH", color = inks.pine)
+            Eyebrow("LOCAL WORKBENCH", color = inks.accent)
             Spacer(Modifier.height(9.dp))
             Text("All on this phone.", style = MaterialTheme.typography.headlineLarge)
             Text("Your files and tools stay in Debian. Pair Tsun with the daemon to work with them here.",
@@ -62,7 +62,7 @@ internal fun PairingScreen(onPair: (Pairing, List<Workspace>) -> Unit) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(13.dp)) {
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        StatusDot(inks.pine)
+                        StatusDot(inks.accent)
                         Text("Pair with Debian", Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
                         Text("127.0.0.1", style = CodeType, color = inks.quiet, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }

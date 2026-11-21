@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(mobile-harness VERSION 0.2.0 LANGUAGES CXX)
+project(mobile-harness VERSION 0.3.0 LANGUAGES CXX)
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
     message(FATAL_ERROR "The daemon needs Linux and glibc 2.34+ (e.g. Debian 12+).")
@@ -23,7 +23,8 @@ FetchContent_MakeAvailable(httplib json)
 find_package(Threads REQUIRED)
 find_package(OpenSSL 3.0 REQUIRED)
 
-add_executable(mobile-harness src/main.cpp src/workspaces.cpp src/jobs.cpp)
+add_executable(mobile-harness src/main.cpp src/workspaces.cpp src/jobs.cpp src/process.cpp
+    src/provider.cpp src/agent_tools.cpp src/agent.cpp)
 target_compile_features(mobile-harness PRIVATE cxx_std_20)
 set_target_properties(mobile-harness PROPERTIES CXX_EXTENSIONS OFF)
 target_compile_options(mobile-harness PRIVATE -Wall -Wextra -Wpedantic)
@@ -37,5 +38,5 @@ if(BUILD_TESTING)
     find_package(Python3 3.8 REQUIRED COMPONENTS Interpreter)
     add_test(NAME daemon.integration COMMAND "${Python3_EXECUTABLE}"
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/daemon_test.py" "$<TARGET_FILE:mobile-harness>")
-    set_tests_properties(daemon.integration PROPERTIES TIMEOUT 40)
+    set_tests_properties(daemon.integration PROPERTIES TIMEOUT 90)
 endif()

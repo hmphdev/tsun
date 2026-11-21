@@ -1,21 +1,19 @@
 package dev.tsun.app
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -53,21 +51,32 @@ import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
+/** Where the main pane points. Kept as plain strings so it survives process death. */
+private object Route {
+    const val Home = "home"
+    const val Thread = "thread"
+    const val Run = "run"
+    const val Files = "files"
+    const val Review = "review"
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-internal fun Workbench(api: DaemonApi, port: Int, initialWorkspaces: List<Workspace>, onForget: () -> Unit) {
+internal fun Workbench(api: DaemonApi, port: Int, initialCatalog: Catalog?, onForget: () -> Unit) {
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     val scope = rememberCoroutineScope()
     val drawer = rememberDrawerState(DrawerValue.Closed)
-    var workspaces by remember(api) { mutableStateOf(initialWorkspaces) }
+    var catalog by remember(api) { mutableStateOf(initialCatalog) }
     var runs by remember(api) { mutableStateOf(RunList(emptyList(), 2)) }
+    var threads by remember(api) { mutableStateOf(ThreadList(emptyList(), 3)) }
     var offline by remember(api) { mutableStateOf<String?>(null) }
-    var online by remember(api) { mutableStateOf(initialWorkspaces.isNotEmpty()) }
+    var online by remember(api) { mutableStateOf(initialCatalog != null) }
     var refresh by remember { mutableIntStateOf(0) }
+    var route by rememberSaveable { mutableStateOf(Route.Home) }
+    var routeId by rememberSaveable { mutableStateOf<String?>(null) }   // thread or run id
+    var fileOwner by rememberSaveable { mutableStateOf<String?>(null) } // thread or run whose worktree is open
+    var fileIsThread by rememberSaveable { mutableStateOf(false) }
     var workspaceId by rememberSaveable { mutableStateOf<String?>(null) }
-    var runId by rememberSaveable { mutableStateOf<String?>(null) }
-    var showFiles by rememberSaveable { mutableStateOf(false) }
-    var fileRunId by rememberSaveable { mutableStateOf<String?>(null) }
     val screenState = rememberSaveableStateHolder()
     var dirty by remember { mutableStateOf(false) }
     var fileBusy by remember { mutableStateOf(false) }
@@ -75,17 +84,21 @@ internal fun Workbench(api: DaemonApi, port: Int, initialWorkspaces: List<Worksp
     var confirmForget by remember { mutableStateOf(false) }
     var actionError by remember { mutableStateOf<String?>(null) }
     var submitting by remember { mutableStateOf(false) }
+
+    val workspaces = catalog?.workspaces.orEmpty()
+    val providers = catalog?.providers.orEmpty()
     val workspace = workspaces.firstOrNull { it.id == workspaceId } ?: workspaces.firstOrNull()
-    val selected = runs.items.firstOrNull { it.id == runId }
-    val fileTask = runs.items.firstOrNull { it.id == fileRunId && it.workspace == workspace?.id }
+    val thread = threads.items.firstOrNull { it.id == routeId }
+    val run = runs.items.firstOrNull { it.id == routeId }
 
     LaunchedEffect(api, lifecycle, refresh) {
         lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
-            var readCatalog = true
+            var readCatalog = catalog == null
             while (true) {
                 try {
-                    if (readCatalog) workspaces = api.catalog()
+                    if (readCatalog) catalog = api.catalog()
                     runs = api.runs()
+                    threads = api.threads()
                     online = true
                     offline = null
                     readCatalog = false
@@ -94,7 +107,8 @@ internal fun Workbench(api: DaemonApi, port: Int, initialWorkspaces: List<Worksp
                     online = false
                     readCatalog = true
                 }
-                delay(if (runs.items.any { it.active }) 850L else 2300L)
+                val busy = runs.items.any { it.active } || threads.items.any { it.active }
+                delay(if (busy) 1200L else 3000L)
             }
         }
     }
@@ -105,44 +119,79 @@ internal fun Workbench(api: DaemonApi, port: Int, initialWorkspaces: List<Worksp
         if (dirty) discardTo = change else change()
     }
 
-    fun selectRun(run: Run?) = navigate {
-        showFiles = false
-        fileRunId = null
-        runId = run?.id
-        if (run != null) workspaceId = run.workspace
+    fun go(next: String, id: String? = null) = navigate {
+        route = next
+        routeId = id
         actionError = null
     }
 
-    fun focusProject(project: Workspace, browse: Boolean) = navigate {
-        if (workspace?.id != project.id || !browse) runId = null
-        workspaceId = project.id
-        showFiles = browse
-        fileRunId = null
+    fun openThread(target: AgentThread) = navigate {
+        workspaceId = target.workspace
+        route = Route.Thread
+        routeId = target.id
         actionError = null
     }
 
-    fun launchPreset(preset: Preset, title: String) {
+    fun openRun(target: Run) = navigate {
+        workspaceId = target.workspace
+        route = Route.Run
+        routeId = target.id
+        actionError = null
+    }
+
+    fun openFiles(owner: String?, isThread: Boolean, project: Workspace? = workspace) = navigate {
+        if (project != null) workspaceId = project.id
+        fileOwner = owner
+        fileIsThread = isThread
+        // Remember where to come back to.
+        if (route != Route.Files) {
+            if (owner == null) routeId = null
+        }
+        route = Route.Files
+        actionError = null
+    }
+
+    fun upsert(updated: AgentThread) {
+        threads = threads.copy(items = listOf(updated) + threads.items.filterNot { it.id == updated.id })
+    }
+
+    fun startThread(prompt: String, mode: Mode, provider: String?) {
+        val target = workspace ?: return
+        if (submitting || prompt.isBlank()) return
+        submitting = true
+        actionError = null
+        scope.launch {
+            try {
+                val created = api.startThread(target.id, prompt, mode, provider)
+                upsert(created)
+                openThread(created)
+            } catch (e: Exception) { actionError = e.userMessage() }
+            finally { submitting = false }
+        }
+    }
+
+    fun launchPreset(preset: Preset) {
         val target = workspace ?: return
         if (submitting) return
         submitting = true
         actionError = null
         scope.launch {
             try {
-                val run = api.launch(target.id, preset.id, title)
-                runs = runs.copy(items = (listOf(run) + runs.items.filterNot { it.id == run.id }).take(32))
-                selectRun(run)
+                val started = api.launch(target.id, preset.id, "")
+                runs = runs.copy(items = (listOf(started) + runs.items.filterNot { it.id == started.id }).take(32))
+                openRun(started)
             } catch (e: Exception) { actionError = e.userMessage() }
             finally { submitting = false; refresh++ }
         }
     }
 
-    fun stopRun(run: Run) {
+    fun stopRun(target: Run) {
         if (submitting) return
         submitting = true
         actionError = null
         scope.launch {
             try {
-                val updated = api.stop(run.id)
+                val updated = api.stop(target.id)
                 runs = runs.copy(items = runs.items.map { if (it.id == updated.id) updated else it })
             } catch (e: Exception) { actionError = e.userMessage() }
             finally { submitting = false; refresh++ }
@@ -151,7 +200,7 @@ internal fun Workbench(api: DaemonApi, port: Int, initialWorkspaces: List<Worksp
 
     discardTo?.let { change ->
         AlertDialog(
-            onDismissRequest = { discardTo = null },
+            onDismissRequest = { discardTo = null }, containerColor = inks.raised,
             title = { Text("Discard unsaved edits?") },
             text = { Text("The file in Debian will keep its last saved version.") },
             confirmButton = { TextButton({ discardTo = null; dirty = false; change() }) { Text("Discard") } },
@@ -160,84 +209,125 @@ internal fun Workbench(api: DaemonApi, port: Int, initialWorkspaces: List<Worksp
     }
     if (confirmForget) {
         AlertDialog(
-            onDismissRequest = { confirmForget = false },
+            onDismissRequest = { confirmForget = false }, containerColor = inks.raised,
             title = { Text("Forget this pairing?") },
-            text = { Text("This removes the key from the app. Running jobs in Debian won't stop.") },
-            confirmButton = { TextButton({ confirmForget = false; navigate(onForget) }) { Text("Forget") } },
+            text = { Text("This removes the key from the app. Agents and presets already running in Debian keep going.") },
+            confirmButton = { TextButton({ confirmForget = false; navigate(onForget) }) { Text("Forget", color = inks.danger) } },
             dismissButton = { TextButton({ confirmForget = false }) { Text("Cancel") } },
         )
+    }
+
+    val title = when (route) {
+        Route.Thread -> thread?.title ?: "Session"
+        Route.Run -> run?.label ?: "Preset"
+        Route.Files -> if (fileOwner == null) workspace?.label ?: "Files" else "Worktree files"
+        Route.Review -> "Review changes"
+        else -> "New session"
     }
 
     ModalNavigationDrawer(
         drawerState = drawer,
         gesturesEnabled = drawer.isOpen,
-        scrimColor = Color.Black.copy(alpha = 0.33f),
+        scrimColor = Color.Black.copy(alpha = 0.5f),
         drawerContent = {
             ModalDrawerSheet(
                 drawerState = drawer,
-                modifier = Modifier.widthIn(max = 318.dp),
-                drawerShape = RoundedCornerShape(topEnd = 18.dp, bottomEnd = 18.dp),
+                modifier = Modifier.widthIn(max = 320.dp),
+                drawerShape = RoundedCornerShape(topEnd = 20.dp, bottomEnd = 20.dp),
                 drawerContainerColor = inks.sheet,
                 windowInsets = WindowInsets(0, 0, 0, 0),
             ) {
-                TaskDrawer(workspaces, workspace, runs.items, selected, showFiles, fileRunId, online, port,
-                    onNew = { selectRun(null) },
-                    onProject = { chosen -> focusProject(chosen, browse = false) },
-                    onProjectFiles = { chosen ->
-                        if (showFiles && workspace?.id == chosen.id && fileRunId == null) scope.launch { drawer.close() }
-                        else focusProject(chosen, browse = true)
-                    },
-                    onRun = { chosen -> selectRun(chosen) },
+                SessionDrawer(
+                    workspaces, threads.items, runs.items, current = routeId.takeIf { route == Route.Thread || route == Route.Run },
+                    online = online, port = port,
+                    onNew = { go(Route.Home) },
+                    onThread = ::openThread, onRun = ::openRun,
+                    onProjectFiles = { project -> openFiles(null, false, project) },
                     onForget = { scope.launch { drawer.close() }; confirmForget = true },
                 )
             }
         },
     ) {
         Column(Modifier.fillMaxSize()) {
-            Row(Modifier.fillMaxWidth().heightIn(min = 55.dp).padding(start = 5.dp, end = 13.dp),
+            Row(Modifier.fillMaxWidth().heightIn(min = 54.dp).padding(start = 4.dp, end = 12.dp),
                 verticalAlignment = Alignment.CenterVertically) {
-                GlyphButton(Glyph.Menu, "Open workspace and run drawer", enabled = !fileBusy) {
-                    scope.launch { drawer.open() }
-                }
-                TsunMark(Modifier.size(20.dp))
-                Text("Tsun", Modifier.padding(start = 7.dp).weight(1f),
-                    style = MaterialTheme.typography.headlineSmall, maxLines = 1)
-                TextButton(onClick = {
-                    navigate {
-                        showFiles = !showFiles
-                        fileRunId = if (showFiles && selected?.branch != null) selected.id else null
-                        actionError = null
-                    }
-                }, enabled = !fileBusy && (showFiles || (workspace != null && selected?.filesReady != false))) {
-                    LineIcon(if (showFiles) Glyph.Runs else Glyph.Folder, color = inks.pine, size = 17)
-                    Spacer(Modifier.width(7.dp))
-                    Text(if (showFiles) "Tasks" else if (selected?.branch != null) "Task files" else "Files")
+                GlyphButton(Glyph.Menu, "Open sessions", enabled = !fileBusy) { scope.launch { drawer.open() } }
+                Text(title, Modifier.padding(start = 4.dp).weight(1f), style = MaterialTheme.typography.titleMedium,
+                    color = inks.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                if (route != Route.Home) {
+                    GlyphButton(Glyph.Plus, "New session", enabled = !fileBusy, tint = inks.accent) { go(Route.Home) }
                 }
             }
-            HorizontalDivider(color = inks.rule)
             offline?.let {
-                PageWidth {
-                    Notice(it, Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 9.dp), error = true)
-                }
+                PageWidth { Notice(it, Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), error = true) }
             }
             PageWidth(Modifier.weight(1f)) {
-                val current = workspace
-                if (showFiles) {
-                    val taskId = fileRunId
-                    if (current == null) {
-                        EmptyNote("No project loaded", "Connect to Debian to open your files.",
-                            Modifier.padding(horizontal = 21.dp, vertical = 20.dp))
-                    } else screenState.SaveableStateProvider("files:${current.id}:${taskId.orEmpty()}") {
-                        val title = if (taskId == null) current.label else fileTask?.label ?: "Task files"
-                        FilesScreen(api, FileScope(current.id, taskId), title, fileTask?.branch,
-                            handlesBack = drawer.isClosed, onDirtyChange = { dirty = it },
-                            onBusyChange = { fileBusy = it }, onHome = { navigate { showFiles = false; fileRunId = null } })
+                when (route) {
+                    Route.Thread -> {
+                        val id = routeId
+                        if (id == null) {
+                            EmptyNote("Session not found", "Start a new one from the menu.", Modifier.padding(20.dp))
+                        } else screenState.SaveableStateProvider("thread:$id") {
+                            ThreadScreen(api, id, thread, providers, handlesBack = drawer.isClosed,
+                                onBack = { go(Route.Home) }, onThread = ::upsert,
+                                onReview = { navigate { route = Route.Review } },
+                                onFiles = { openFiles(id, true) })
+                        }
                     }
-                } else {
-                    screenState.SaveableStateProvider("runs") {
-                        RunsScreen(api, workspace, workspaces, runs, selected, online, submitting, actionError,
-                            handlesBack = drawer.isClosed, onSelect = { selectRun(it) }, onNew = { selectRun(null) },
-                            onLaunch = ::launchPreset, onStop = ::stopRun)
+                    Route.Review -> {
+                        val target = thread
+                        if (target == null) Text("Loading…", Modifier.padding(20.dp), color = inks.faint)
+                        else ReviewScreen(api, target, handlesBack = drawer.isClosed,
+                            onBack = { navigate { route = Route.Thread } })
+                    }
+                    Route.Run -> {
+                        val target = run
+                        if (target == null) {
+                            EmptyNote("Run not found", "The daemon may have restarted.", Modifier.padding(20.dp),
+                                action = "New session") { go(Route.Home) }
+                        } else screenState.SaveableStateProvider("run:${target.id}") {
+                            RunScreen(api, target, workspaces.firstOrNull { it.id == target.workspace }?.label, online,
+                                submitting, actionError, handlesBack = drawer.isClosed, onBack = { go(Route.Home) },
+                                onStop = ::stopRun, onFiles = { openFiles(target.id, false) })
+                        }
+                    }
+                    Route.Files -> {
+                        val current = workspace
+                        if (current == null) {
+                            EmptyNote("No project loaded", "Connect to Debian to open your files.", Modifier.padding(20.dp))
+                        } else {
+                            val owner = fileOwner
+                            val fileScope = when {
+                                owner == null -> FileScope(current.id)
+                                fileIsThread -> FileScope(current.id, thread = owner)
+                                else -> FileScope(current.id, run = owner)
+                            }
+                            val branch = if (fileIsThread) threads.items.firstOrNull { it.id == owner }?.branch
+                                else runs.items.firstOrNull { it.id == owner }?.branch
+                            screenState.SaveableStateProvider("files:${current.id}:${owner.orEmpty()}") {
+                                FilesScreen(api, fileScope, if (owner == null) current.label else title, branch,
+                                    handlesBack = drawer.isClosed, onDirtyChange = { dirty = it },
+                                    onBusyChange = { fileBusy = it }, onHome = {
+                                        navigate {
+                                            route = when {
+                                                owner == null -> Route.Home
+                                                fileIsThread -> Route.Thread
+                                                else -> Route.Run
+                                            }
+                                            routeId = owner
+                                        }
+                                    })
+                            }
+                        }
+                    }
+                    else -> screenState.SaveableStateProvider("home") {
+                        NewSessionScreen(
+                            workspace, workspaces, providers, catalog?.defaultProvider,
+                            recent = threads.items.filter { it.workspace == workspace?.id },
+                            online = online, busy = submitting, error = actionError,
+                            onWorkspace = { workspaceId = it.id },
+                            onStart = ::startThread, onPreset = ::launchPreset, onOpen = ::openThread,
+                        )
                     }
                 }
             }
@@ -246,52 +336,53 @@ internal fun Workbench(api: DaemonApi, port: Int, initialWorkspaces: List<Worksp
 }
 
 @Composable
-private fun TaskDrawer(
-    workspaces: List<Workspace>, workspace: Workspace?, runs: List<Run>, selected: Run?, files: Boolean,
-    fileRunId: String?, online: Boolean, port: Int, onNew: () -> Unit, onProject: (Workspace) -> Unit,
-    onProjectFiles: (Workspace) -> Unit, onRun: (Run) -> Unit, onForget: () -> Unit,
+private fun SessionDrawer(
+    workspaces: List<Workspace>, threads: List<AgentThread>, runs: List<Run>, current: String?,
+    online: Boolean, port: Int, onNew: () -> Unit, onThread: (AgentThread) -> Unit, onRun: (Run) -> Unit,
+    onProjectFiles: (Workspace) -> Unit, onForget: () -> Unit,
 ) {
-    val byProject = runs.groupBy { it.workspace }
-    Column(Modifier.fillMaxHeight().padding(horizontal = 15.dp)) {
-        Row(Modifier.padding(start = 11.dp, top = 25.dp, bottom = 16.dp),
-            verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(11.dp)) {
-            TsunMark(Modifier.size(29.dp))
-            Column {
-                Text("Tsun", style = MaterialTheme.typography.headlineMedium)
-                Eyebrow("LOCAL WORKBENCH")
-            }
+    val threadsByProject = threads.groupBy { it.workspace }
+    val runsByProject = runs.groupBy { it.workspace }
+    Column(Modifier.fillMaxHeight().padding(horizontal = 12.dp)) {
+        Row(Modifier.padding(start = 10.dp, top = 22.dp, bottom = 16.dp),
+            verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            TsunMark(Modifier.size(24.dp))
+            Text("Tsun", style = MaterialTheme.typography.headlineSmall, color = inks.ink)
         }
-        DrawerRow("New task", Glyph.Plus, false, onNew)
-        HorizontalDivider(Modifier.padding(top = 9.dp), color = inks.rule)
-        LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(bottom = 16.dp)) {
-            item { Eyebrow("PROJECTS", Modifier.padding(start = 11.dp, top = 18.dp, bottom = 5.dp)) }
+        Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).border(1.dp, inks.rule, RoundedCornerShape(12.dp))
+            .clickable(role = Role.Button, onClick = onNew).heightIn(min = 46.dp).padding(horizontal = 12.dp),
+            verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            LineIcon(Glyph.Plus, color = inks.accent, size = 17)
+            Text("New session", style = MaterialTheme.typography.titleSmall, color = inks.ink)
+        }
+        LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(top = 8.dp, bottom = 16.dp)) {
             if (workspaces.isEmpty()) item {
-                Text("No projects loaded", Modifier.padding(start = 11.dp, top = 4.dp), color = inks.quiet)
+                Text("No projects loaded", Modifier.padding(start = 12.dp, top = 16.dp), color = inks.faint)
             }
             for (project in workspaces) {
-                val tasks = byProject[project.id].orEmpty()
+                val projectThreads = threadsByProject[project.id].orEmpty()
+                val projectRuns = runsByProject[project.id].orEmpty()
                 item(key = "project:${project.id}") {
-                    val here = workspace?.id == project.id && (files && fileRunId == null || !files && selected == null)
-                    Row(Modifier.fillMaxWidth().padding(top = 5.dp).clip(RoundedCornerShape(9.dp))
-                        .background(if (here) inks.moss else Color.Transparent), verticalAlignment = Alignment.CenterVertically) {
-                        Row(Modifier.weight(1f).clickable(role = Role.Button) { onProject(project) }
-                            .heightIn(min = 48.dp).padding(start = 11.dp, end = 5.dp),
-                            verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(9.dp)) {
-                            LineIcon(Glyph.Folder, color = inks.pine, size = 17)
-                            Text(project.label, style = MaterialTheme.typography.titleMedium,
-                                maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        }
-                        GlyphButton(Glyph.File, "Browse ${project.label} checkout") { onProjectFiles(project) }
+                    Row(Modifier.fillMaxWidth().padding(top = 14.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Eyebrow(project.label.uppercase(), Modifier.padding(start = 12.dp).weight(1f))
+                        GlyphButton(Glyph.Folder, "Browse ${project.label}", tint = inks.quiet) { onProjectFiles(project) }
                     }
                 }
-                items(tasks, key = { "run:${it.id}" }) { run ->
-                    val here = (if (files) fileRunId else selected?.id) == run.id
-                    Row(Modifier.fillMaxWidth().padding(start = 13.dp).clip(RoundedCornerShape(8.dp))
-                        .background(if (here) inks.moss else Color.Transparent)
-                        .clickable(role = Role.Button) { onRun(run) }
-                        .heightIn(min = 48.dp).padding(start = 12.dp, end = 7.dp, top = 6.dp, bottom = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(9.dp)) {
-                        Text(run.label, Modifier.weight(1f), style = MaterialTheme.typography.titleSmall,
+                if (projectThreads.isEmpty() && projectRuns.isEmpty()) item(key = "empty:${project.id}") {
+                    Text("No sessions yet", Modifier.padding(start = 12.dp, bottom = 4.dp),
+                        style = MaterialTheme.typography.bodySmall, color = inks.faint)
+                }
+                items(projectThreads, key = { "thread:${it.id}" }) { thread ->
+                    ThreadRow(thread, selected = thread.id == current) { onThread(thread) }
+                }
+                items(projectRuns, key = { "run:${it.id}" }) { run ->
+                    Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
+                        .background(if (run.id == current) inks.accentWash else Color.Transparent)
+                        .clickable(role = Role.Button) { onRun(run) }.heightIn(min = 44.dp)
+                        .padding(horizontal = 12.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        LineIcon(Glyph.Terminal, size = 15, color = inks.faint)
+                        Text(run.label, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium, color = inks.quiet,
                             maxLines = 1, overflow = TextOverflow.Ellipsis)
                         RunState(run)
                     }
@@ -299,22 +390,14 @@ private fun TaskDrawer(
             }
         }
         HorizontalDivider(color = inks.rule)
-        Row(Modifier.padding(start = 11.dp, top = 13.dp), verticalAlignment = Alignment.CenterVertically) {
-            StatusDot(if (online) inks.pine else inks.rust)
-            Text(if (online) "Debian · localhost:$port" else "Debian · disconnected",
-                Modifier.padding(start = 8.dp), color = inks.quiet, style = MaterialTheme.typography.bodySmall)
+        Row(Modifier.padding(start = 12.dp, top = 12.dp), verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            StatusDot(if (online) inks.sage else inks.danger)
+            Text(if (online) "Debian · localhost:$port" else "Debian · disconnected", color = inks.faint,
+                style = MaterialTheme.typography.bodySmall)
         }
-        TextButton(onClick = onForget, modifier = Modifier.padding(bottom = 5.dp)) { Text("Forget pairing") }
-    }
-}
-
-@Composable
-private fun DrawerRow(label: String, glyph: Glyph, selected: Boolean, onClick: () -> Unit) {
-    Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(9.dp))
-        .background(if (selected) inks.moss else Color.Transparent).clickable(role = Role.Button, onClick = onClick)
-        .heightIn(min = 46.dp).padding(horizontal = 11.dp, vertical = 4.dp),
-        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-        LineIcon(glyph, color = if (selected || glyph == Glyph.Plus) inks.pine else inks.quiet, size = 18)
-        Text(label, style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        TextButton(onClick = onForget, modifier = Modifier.padding(bottom = 6.dp)) {
+            Text("Forget pairing", color = inks.quiet)
+        }
     }
 }

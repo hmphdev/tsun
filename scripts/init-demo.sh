@@ -43,4 +43,5 @@ Path(destination).write_text(json.dumps(config, indent=2) + "\n", encoding="utf-
 PY
 
 printf 'Daemon state: %s\nWorkspace copy: %s\n' "$state" "$target/workspace"
+printf 'For the agent, save an Anthropic API key with: (umask 077; cat > %q)\n' "$state/anthropic-key"
 printf 'Start with: %q %q\n' "$repo/build/mobile-harness" "$state"

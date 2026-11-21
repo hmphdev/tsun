@@ -1,6 +1,8 @@
 from contextlib import closing
 import hashlib
 import http.client
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import threading
 import json
 import os
 from pathlib import Path
@@ -16,6 +18,111 @@ from urllib.parse import urlencode
 
 
 DAEMON = Path(sys.argv.pop(1)).resolve()
+
+
+def anthropic_stream(blocks, stop_reason):
+    """Encode assistant blocks as an Anthropic Messages SSE stream."""
+    events = [{"type": "message_start", "message": {"id": "msg_test", "type": "message", "role": "assistant",
+               "model": "mock-claude", "content": [], "usage": {"input_tokens": 11, "output_tokens": 1}}}]
+    for index, block in enumerate(blocks):
+        kind = block["type"]
+        if kind == "text":
+            events.append({"type": "content_block_start", "index": index, "content_block": {"type": "text", "text": ""}})
+            text = block["text"]
+            for part in (text[: len(text) // 2], text[len(text) // 2:]):
+                events.append({"type": "content_block_delta", "index": index, "delta": {"type": "text_delta", "text": part}})
+        elif kind == "thinking":
+            events.append({"type": "content_block_start", "index": index,
+                           "content_block": {"type": "thinking", "thinking": "", "signature": ""}})
+            events.append({"type": "content_block_delta", "index": index,
+                           "delta": {"type": "thinking_delta", "thinking": block["thinking"]}})
+            events.append({"type": "content_block_delta", "index": index,
+                           "delta": {"type": "signature_delta", "signature": block["signature"]}})
+        elif kind == "tool_use":
+            events.append({"type": "content_block_start", "index": index, "content_block":
+                           {"type": "tool_use", "id": block["id"], "name": block["name"], "input": {}}})
+            raw = json.dumps(block["input"])
+            for part in (raw[:5], raw[5:]):
+                events.append({"type": "content_block_delta", "index": index,
+                               "delta": {"type": "input_json_delta", "partial_json": part}})
+        events.append({"type": "content_block_stop", "index": index})
+    events.append({"type": "message_delta", "delta": {"stop_reason": stop_reason}, "usage": {"output_tokens": 7}})
+    events.append({"type": "message_stop"})
+    return "".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events).encode()
+
+
+def openai_stream(content=None, reasoning=None, calls=(), finish="stop"):
+    """Encode a Chat Completions SSE stream with optional reasoning and tool calls."""
+    chunks = []
+    if reasoning:
+        chunks.append({"choices": [{"index": 0, "delta": {"reasoning_content": reasoning}}]})
+    if content:
+        for part in (content[: len(content) // 2], content[len(content) // 2:]):
+            chunks.append({"choices": [{"index": 0, "delta": {"content": part}}]})
+    for index, (call_id, name, arguments) in enumerate(calls):
+        raw = json.dumps(arguments)
+        chunks.append({"choices": [{"index": 0, "delta": {"tool_calls": [
+            {"index": index, "id": call_id, "type": "function", "function": {"name": name, "arguments": raw[:4]}}]}}]})
+        chunks.append({"choices": [{"index": 0, "delta": {"tool_calls": [
+            {"index": index, "function": {"arguments": raw[4:]}}]}}]})
+    chunks.append({"model": "mock-local", "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]})
+    chunks.append({"choices": [], "usage": {"prompt_tokens": 20, "completion_tokens": 5}})
+    return "".join(f"data: {json.dumps(c)}\n\n" for c in chunks).encode() + b"data: [DONE]\n\n"
+
+
+class MockProvider:
+    """A scripted model API: each request pops the next canned stream."""
+
+    def __init__(self):
+        self.script = []
+        self.requests = []
+        self.lock = threading.Lock()
+        provider = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                with provider.lock:
+                    provider.requests.append({"path": self.path, "headers": dict(self.headers), "body": body})
+                    reply = provider.script.pop(0) if provider.script else None
+                if callable(reply):
+                    reply = reply(body)
+                if reply is None:
+                    payload = json.dumps({"error": {"type": "invalid_request_error", "message": "script exhausted"}}).encode()
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(reply)))
+                self.end_headers()
+                self.wfile.write(reply)
+
+        self.release = threading.Event()
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.server.block_on_close = False
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    @property
+    def url(self):
+        return f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def hang(self, _body):
+        self.release.wait(20)  # a model that says nothing for a long time
+        return None
+
+    def close(self):
+        self.release.set()
+        self.server.shutdown()
+        self.server.server_close()
 
 
 class DaemonTest(unittest.TestCase):
@@ -70,9 +177,20 @@ class DaemonTest(unittest.TestCase):
         ], capture_output=True, check=True, timeout=5)
         key.chmod(0o600)
         self.tls = ssl.create_default_context(cafile=str(self.cert))
+        self.model = MockProvider()
+        self.addCleanup(self.model.close)
+        key_file = self.state / "anthropic-key"
+        key_file.write_text("test-key\n", encoding="ascii")
+        key_file.chmod(0o600)
         self.config = config = self.state / "config.json"
         config.write_text(json.dumps({
             "port": 0,
+            "agent": {"default": "claude", "providers": [
+                {"id": "claude", "kind": "anthropic", "label": "Mock Claude", "model": "mock-claude",
+                 "baseUrl": self.model.url},
+                {"id": "local", "kind": "openai", "label": "Mock local", "model": "mock-local",
+                 "baseUrl": self.model.url + "/v1", "apiKeyEnv": ""},
+            ]},
             "workspaces": [{
                 "id": "demo", "root": str(self.workspace), "worktrees": False, "commands": [
                     {"id": "linger", "argv": ["/bin/sh", "-c", "pwd; echo running; exec /bin/sleep 60"]},
@@ -165,7 +283,10 @@ class DaemonTest(unittest.TestCase):
         data, headers = self.request("GET", "/v1/workspaces")
         self.assertEqual(headers["Cache-Control"], "no-store")
         catalog = json.loads(data)
-        self.assertEqual(catalog["protocol"], 2)
+        self.assertEqual(catalog["protocol"], 3)
+        self.assertEqual(catalog["agent"]["default"], "claude")
+        self.assertEqual([p["kind"] for p in catalog["agent"]["providers"]], ["anthropic", "openai"])
+        self.assertTrue(all(p["enabled"] for p in catalog["agent"]["providers"]))
         self.assertEqual(catalog["workspaces"][0]["id"], "demo")
         self.assertFalse(catalog["workspaces"][0]["worktrees"])
         self.assertTrue(catalog["workspaces"][1]["worktrees"])
@@ -322,6 +443,180 @@ class DaemonTest(unittest.TestCase):
                 break
             self.assertLess(time.monotonic(), deadline, "a child survived Stop")
             time.sleep(0.03)
+
+
+    # ---- Agent threads ---------------------------------------------------------
+
+    def post(self, path, body, status=200):
+        return self.api("POST", path, status=status, headers={"Content-Type": "application/json"},
+                        body=json.dumps(body))
+
+    def thread_until(self, thread_id, predicate, timeout=10):
+        deadline = time.monotonic() + timeout
+        items, rev = {}, 0
+        while True:
+            page = self.api("GET", f"/v1/threads/{thread_id}?since={rev}&wait=300")
+            if page["reset"]:
+                items = {}
+            for entry in page["items"]:
+                items[entry["id"]] = entry
+            rev = page["rev"]
+            ordered = sorted(items.values(), key=lambda entry: int(entry["id"][1:]) if entry["id"][1:].isdigit() else -1)
+            if predicate(page["thread"], ordered):
+                return page["thread"], ordered
+            if time.monotonic() >= deadline:
+                self.fail("Thread did not reach expected state: " + json.dumps(page["thread"]) + json.dumps(ordered)[-1500:])
+
+    def test_agent_loop_approvals_checkpoints_and_provider_switch(self):
+        self.model.script += [
+            anthropic_stream([
+                {"type": "thinking", "thinking": "Plan: write a file.", "signature": "sig-abc"},
+                {"type": "text", "text": "Adding the note."},
+                {"type": "tool_use", "id": "toolu_1", "name": "write_file",
+                 "input": {"path": "hello.txt", "content": "hi\n"}},
+            ], "tool_use"),
+            anthropic_stream([{"type": "tool_use", "id": "toolu_2", "name": "bash",
+                               "input": {"command": "cat hello.txt; echo $TERM"}}], "tool_use"),
+            anthropic_stream([{"type": "text", "text": "Done: hello.txt says hi."}], "end_turn"),
+        ]
+        thread = self.post("/v1/threads", {"workspace": "isolated", "prompt": "Add a hello note", "mode": "edits"}, 201)
+        self.assertEqual(thread["provider"], "claude")
+        self.assertTrue(thread["branch"].startswith("tsun/agent-"))
+        thread_id = thread["id"]
+
+        # Edits run on their own in "edits" mode; the shell command waits for approval.
+        thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "waiting")
+        tools = [entry for entry in items if entry["kind"] == "tool"]
+        self.assertEqual([(t["name"], t["status"]) for t in tools], [("write_file", "done"), ("bash", "waiting")])
+        self.assertEqual(thread["pendingCall"], tools[1]["id"])
+        self.assertIn("cat hello.txt", tools[1]["detail"])
+        self.assertEqual(next(e for e in items if e["kind"] == "thinking")["text"], "Plan: write a file.")
+        worktree = self.state / "worktrees" / f"isolated-{thread_id}"
+        self.assertEqual((worktree / "hello.txt").read_text(encoding="utf-8"), "hi\n")
+        self.assertFalse((self.repo / "hello.txt").exists())
+
+        self.post(f"/v1/threads/{thread_id}/approval", {"call": "wrong", "decision": "allow"}, 409)
+        self.post(f"/v1/threads/{thread_id}/approval", {"call": thread["pendingCall"], "decision": "allow"})
+        thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle")
+        bash = [e for e in items if e["kind"] == "tool"][1]
+        self.assertEqual((bash["status"], bash["exitCode"]), ("done", 0))
+        self.assertIn("hi\ndumb", bash["output"])
+        self.assertEqual(items[-2]["text"], "Done: hello.txt says hi.")
+        self.assertEqual(items[-1]["kind"], "run")
+        self.assertEqual((items[-1]["additions"], items[-1]["files"][0]["path"]), (1, "hello.txt"))
+        self.assertEqual((thread["additions"], thread["filesChanged"]), (1, 1))
+
+        # The wire format: tools, headers, and the reasoning block replayed unchanged.
+        first, second, third = self.model.requests[:3]
+        self.assertEqual(first["path"], "/v1/messages")
+        self.assertEqual(first["headers"]["x-api-key"], "test-key")
+        self.assertEqual({t["name"] for t in first["body"]["tools"]},
+                         {"bash", "read_file", "write_file", "edit_file", "list_files", "search"})
+        self.assertNotIn("eager_input_streaming", first["body"]["tools"][0])  # not the first-party API
+        replayed = second["body"]["messages"][1]["content"]
+        self.assertEqual(replayed[0], {"type": "thinking", "thinking": "Plan: write a file.", "signature": "sig-abc"})
+        self.assertEqual(second["body"]["messages"][2]["content"][0]["tool_use_id"], "toolu_1")
+        self.assertEqual(third["body"]["messages"][:3], second["body"]["messages"])  # append-only history
+
+        # A hidden checkpoint ref records the run without touching the branch.
+        refs = self.git(self.repo, "for-each-ref", "--format=%(refname)", "refs/tsun/")
+        self.assertEqual(refs, f"refs/tsun/checkpoints/{thread_id}/1")
+        self.assertEqual(self.git(worktree, "status", "--porcelain"), "?? hello.txt")
+        diff = self.api("GET", f"/v1/threads/{thread_id}/diff")
+        self.assertIn("+hi", diff["diff"])
+        self.assertEqual(diff["files"][0]["path"], "hello.txt")
+
+        # Switch to the OpenAI-compatible provider mid-thread; the history carries over.
+        self.model.script += [
+            openai_stream(reasoning="Edit it.", calls=[("call_9", "edit_file",
+                          {"path": str(worktree / "hello.txt"), "old_text": "hi", "new_text": "hello"})], finish="tool_calls"),
+            openai_stream(content="Changed to hello."),
+        ]
+        self.post(f"/v1/threads/{thread_id}/messages", {"text": "Say hello instead", "provider": "local"}, 202)
+        thread, items = self.thread_until(thread_id, lambda t, i: t["state"] == "idle" and t["runs"] == 2)
+        self.assertEqual(thread["provider"], "local")
+        self.assertEqual((worktree / "hello.txt").read_text(encoding="utf-8"), "hello\n")
+        fourth, fifth = self.model.requests[3:5]
+        self.assertEqual(fourth["path"], "/v1/chat/completions")
+        self.assertNotIn("Authorization", fourth["headers"])
+        messages = fourth["body"]["messages"]
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertEqual(messages[2]["tool_calls"][0]["function"]["name"], "write_file")
+        self.assertEqual((messages[3]["role"], messages[3]["tool_call_id"]), ("tool", "toolu_1"))
+        self.assertEqual(messages[-1], {"role": "user", "content": "Say hello instead"})
+        self.assertEqual(fifth["body"]["messages"][-1]["role"], "tool")
+        self.assertEqual(fifth["body"]["messages"][-1]["tool_call_id"], "call_9")
+        self.assertEqual(items[-1]["additions"], 1)
+        self.assertEqual(self.git(self.repo, "for-each-ref", "--format=%(refname)", "refs/tsun/").splitlines()[-1],
+                         f"refs/tsun/checkpoints/{thread_id}/2")
+
+    def test_agent_denials_confinement_and_interrupt(self):
+        self.model.script += [
+            anthropic_stream([
+                {"type": "tool_use", "id": "toolu_a", "name": "write_file", "input": {"path": "../escape.txt", "content": "x"}},
+                {"type": "tool_use", "id": "toolu_b", "name": "read_file", "input": {"path": "/etc/passwd"}},
+                {"type": "tool_use", "id": "toolu_c", "name": "read_file", "input": {"path": ".git/config"}},
+                {"type": "tool_use", "id": "toolu_d", "name": "bash", "input": {"command": "touch denied"}},
+            ], "tool_use"),
+            anthropic_stream([{"type": "tool_use", "id": "toolu_e", "name": "bash",
+                               "input": {"command": "exec sleep 30"}}], "tool_use"),
+        ]
+        thread_id = self.post("/v1/threads", {"workspace": "isolated", "prompt": "Try things", "mode": "ask"}, 201)["id"]
+        thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "waiting")
+        tools = [e for e in items if e["kind"] == "tool"]
+        self.assertEqual([t["status"] for t in tools], ["error", "error", "error", "waiting"])
+        self.assertIn("inside the workspace", tools[1]["output"])
+        self.assertIn(".git", tools[2]["output"])
+        self.post(f"/v1/threads/{thread_id}/approval", {"call": thread["pendingCall"], "decision": "deny"})
+
+        # Widening the mode answers the next request; then Stop kills the running command.
+        thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "waiting")
+        self.post(f"/v1/threads/{thread_id}/settings", {"mode": "full"})
+        self.thread_until(thread_id, lambda t, i: any(e.get("call") == "toolu_e" and e["status"] == "running" for e in i))
+        started = time.monotonic()
+        self.post(f"/v1/threads/{thread_id}/interrupt", {})
+        thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle")
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(next(e for e in items if e.get("call") == "toolu_d")["status"], "denied")
+        self.assertEqual(next(e for e in items if e.get("call") == "toolu_e")["status"], "error")
+        self.assertTrue(items[-1]["stopped"])
+        worktree = self.state / "worktrees" / f"isolated-{thread_id}"
+        self.assertFalse((worktree / "denied").exists())
+        self.assertFalse((self.state / "worktrees" / "escape.txt").exists())
+
+        # The next run starts from a valid history: every tool call has a result.
+        self.model.script.append(anthropic_stream([{"type": "text", "text": "OK."}], "end_turn"))
+        self.post(f"/v1/threads/{thread_id}/messages", {"text": "Never mind"}, 202)
+        self.thread_until(thread_id, lambda t, _: t["state"] == "idle" and t["runs"] == 2)
+        history = self.model.requests[-1]["body"]["messages"]
+        results = [b for m in history if m["role"] == "user" for b in m["content"] if b["type"] == "tool_result"]
+        self.assertEqual([r["tool_use_id"] for r in results], ["toolu_a", "toolu_b", "toolu_c", "toolu_d", "toolu_e"])
+        self.assertTrue(all(r.get("is_error") for r in results))
+        self.assertEqual(history[-1]["content"][-1], {"type": "text", "text": "Never mind"})
+
+    def test_agent_interrupts_a_silent_model(self):
+        self.model.script.append(self.model.hang)
+        thread_id = self.post("/v1/threads", {"workspace": "demo", "prompt": "Think hard"}, 201)["id"]
+        deadline = time.monotonic() + 5
+        while not self.model.requests:
+            self.assertLess(time.monotonic(), deadline, "the model was never called")
+            time.sleep(0.02)
+        started = time.monotonic()
+        self.post(f"/v1/threads/{thread_id}/interrupt", {})
+        thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle", timeout=5)
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertIsNone(thread["error"])
+        self.assertEqual(items[-2]["text"], "Stopped.")
+
+    def test_agent_reports_provider_errors(self):
+        thread_id = self.post("/v1/threads", {"workspace": "demo", "prompt": "Hello"}, 201)["id"]
+        thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle")
+        self.assertIn("script exhausted", thread["error"])
+        self.assertEqual(items[-2]["tone"], "error")
+        self.assertIsNone(thread["branch"])
+        self.post("/v1/threads", {"workspace": "demo", "prompt": "x", "provider": "nope"}, 400)
+        self.post("/v1/threads", {"workspace": "demo", "prompt": "   "}, 400)
+        self.api("GET", "/v1/threads/" + "0" * 24, status=404)
 
 
 if __name__ == "__main__":

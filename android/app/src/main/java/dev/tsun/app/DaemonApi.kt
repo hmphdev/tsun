@@ -58,7 +58,7 @@ private class DaemonTrust(fingerprint: String) : X509TrustManager {
 
 internal data class Preset(val id: String, val label: String)
 internal data class Workspace(val id: String, val label: String, val worktrees: Boolean, val presets: List<Preset>)
-internal data class FileScope(val workspace: String, val run: String? = null)
+internal data class FileScope(val workspace: String, val run: String? = null, val thread: String? = null)
 internal data class Entry(val name: String, val directory: Boolean, val size: Long)
 internal data class Listing(val entries: List<Entry>, val truncated: Boolean)
 internal data class Document(val text: String, val revision: String)
@@ -70,6 +70,57 @@ internal data class Run(
 }
 internal data class RunList(val items: List<Run>, val capacity: Int)
 internal data class Transcript(val run: Run, val log: String, val truncated: Boolean)
+
+// ---- Agent threads (protocol 3) ----------------------------------------------
+
+internal data class ModelProvider(
+    val id: String, val label: String, val kind: String, val model: String, val enabled: Boolean, val reason: String?,
+)
+internal data class Catalog(val workspaces: List<Workspace>, val providers: List<ModelProvider>, val defaultProvider: String?)
+
+internal enum class Mode(val wire: String, val label: String, val hint: String) {
+    Ask("ask", "Ask first", "Approve every edit and command"),
+    Edits("edits", "Auto-edit", "Edits run; commands wait for you"),
+    Full("full", "Full access", "Edits and commands run without asking");
+
+    companion object {
+        fun of(wire: String) = entries.firstOrNull { it.wire == wire } ?: Edits
+    }
+}
+
+internal data class AgentThread(
+    val id: String, val workspace: String, val title: String, val state: String, val mode: Mode,
+    val provider: String, val providerLabel: String, val model: String, val branch: String?, val filesReady: Boolean,
+    val runs: Int, val pendingCall: String?, val additions: Int, val deletions: Int, val filesChanged: Int,
+    val inputTokens: Long, val outputTokens: Long, val error: String?, val updatedAt: Long,
+) {
+    val active get() = state != "idle"
+}
+internal data class ThreadList(val items: List<AgentThread>, val capacity: Int)
+internal data class FileStat(val path: String, val additions: Int, val deletions: Int, val binary: Boolean)
+
+internal sealed interface ThreadItem {
+    val id: String
+    val run: Int
+
+    data class User(override val id: String, override val run: Int, val text: String) : ThreadItem
+    data class Text(override val id: String, override val run: Int, val text: String, val streaming: Boolean) : ThreadItem
+    data class Thinking(override val id: String, override val run: Int, val text: String, val streaming: Boolean) : ThreadItem
+    data class Tool(
+        override val id: String, override val run: Int, val name: String, val title: String, val detail: String,
+        val status: String, val output: String?, val exitCode: Int?, val before: String?, val after: String?,
+        val created: Boolean,
+    ) : ThreadItem {
+        val risky get() = name == "bash" || name == "write_file" || name == "edit_file"
+    }
+    data class Note(override val id: String, override val run: Int, val text: String, val error: Boolean) : ThreadItem
+    data class RunEnd(
+        override val id: String, override val run: Int, val durationMs: Long, val additions: Int, val deletions: Int,
+        val files: List<FileStat>, val stopped: Boolean,
+    ) : ThreadItem
+}
+internal data class ThreadPage(val thread: AgentThread, val rev: Long, val reset: Boolean, val items: List<ThreadItem>)
+internal data class Review(val diff: String, val truncated: Boolean, val files: List<FileStat>, val additions: Int, val deletions: Int)
 
 internal class ApiError(val status: Int, message: String) : IOException(message)
 
@@ -90,16 +141,61 @@ internal class DaemonApi(private val pairing: Pairing) {
         SSLContext.getInstance("TLS").apply { init(null, arrayOf(DaemonTrust(pairing.fingerprint)), null) }.socketFactory
     }
 
-    suspend fun catalog(): List<Workspace> {
+    suspend fun catalog(): Catalog {
         val response = json("/v1/workspaces")
-        if (response.getInt("protocol") != 2) throw ApiError(426, "Rebuild and restart the Tsun 0.2 daemon in Debian.")
-        return response.getJSONArray("workspaces").mapObjects { workspace ->
+        if (response.getInt("protocol") != 3) throw ApiError(426, "Rebuild and restart the Tsun 0.3 daemon in Debian.")
+        val workspaces = response.getJSONArray("workspaces").mapObjects { workspace ->
             Workspace(workspace.getString("id"), workspace.getString("label"), workspace.getBoolean("worktrees"),
                 workspace.getJSONArray("commands").mapObjects {
                     Preset(it.getString("id"), it.getString("label"))
                 })
         }
+        val agent = response.getJSONObject("agent")
+        val providers = agent.getJSONArray("providers").mapObjects {
+            ModelProvider(it.getString("id"), it.getString("label"), it.getString("kind"), it.getString("model"),
+                it.getBoolean("enabled"), it.optStringOrNull("reason"))
+        }
+        return Catalog(workspaces, providers, agent.optStringOrNull("default"))
     }
+
+    suspend fun threads(): ThreadList {
+        val response = json("/v1/threads")
+        return ThreadList(response.getJSONArray("threads").mapObjects { it.thread() }, response.getInt("capacity"))
+    }
+
+    /** Long-polls for up to [waitMs] when nothing changed since [since]. */
+    suspend fun thread(id: String, since: Long, waitMs: Int): ThreadPage {
+        val response = json("/v1/threads/${encode(id)}?since=$since&wait=$waitMs")
+        return ThreadPage(response.getJSONObject("thread").thread(), response.getLong("rev"),
+            response.getBoolean("reset"), response.getJSONArray("items").mapObjects { it.threadItem() }.filterNotNull())
+    }
+
+    suspend fun startThread(workspace: String, prompt: String, mode: Mode, provider: String?): AgentThread =
+        post("/v1/threads", JSONObject().put("workspace", workspace).put("prompt", prompt).put("mode", mode.wire)
+            .apply { if (provider != null) put("provider", provider) }).thread()
+
+    suspend fun reply(id: String, text: String, mode: Mode, provider: String?): AgentThread =
+        post("/v1/threads/${encode(id)}/messages", JSONObject().put("text", text).put("mode", mode.wire)
+            .apply { if (provider != null) put("provider", provider) }).thread()
+
+    suspend fun setMode(id: String, mode: Mode): AgentThread =
+        post("/v1/threads/${encode(id)}/settings", JSONObject().put("mode", mode.wire)).thread()
+
+    suspend fun interrupt(id: String): AgentThread = post("/v1/threads/${encode(id)}/interrupt", JSONObject()).thread()
+
+    suspend fun decide(id: String, call: String, allow: Boolean): AgentThread =
+        post("/v1/threads/${encode(id)}/approval", JSONObject().put("call", call)
+            .put("decision", if (allow) "allow" else "deny")).thread()
+
+    suspend fun review(id: String): Review {
+        val response = json("/v1/threads/${encode(id)}/diff", timeout = 30_000)
+        return Review(response.getString("diff"), response.optBoolean("truncated"),
+            response.getJSONArray("files").mapObjects { it.fileStat() },
+            response.optInt("additions"), response.optInt("deletions"))
+    }
+
+    private suspend fun post(path: String, body: JSONObject): JSONObject =
+        json(path, "POST", body.toString().toByteArray(Charsets.UTF_8), "application/json")
 
     suspend fun entries(scope: FileScope, path: String): Listing {
         val response = json(fileRoute("entries", scope, path))
@@ -159,15 +255,16 @@ internal class DaemonApi(private val pairing: Pairing) {
 
     private suspend fun json(
         path: String, method: String = "GET", body: ByteArray? = null,
-        contentType: String? = null, revision: String? = null,
-    ): JSONObject = request(path, method, body, contentType, revision) { input, _ ->
+        contentType: String? = null, revision: String? = null, timeout: Int = 5000,
+    ): JSONObject = request(path, method, body, contentType, revision, timeout) { input, _ ->
         // A 1 MiB UTF-8 file can be up to 6 MiB after JSON escaping control characters.
         JSONObject(input.readBounded(8 * 1024 * 1024, "Response is too large.").toString(Charsets.UTF_8))
     }
 
     private suspend fun <T> request(
         path: String, method: String = "GET", body: ByteArray? = null,
-        contentType: String? = null, revision: String? = null, consume: (InputStream, Long) -> T,
+        contentType: String? = null, revision: String? = null, timeout: Int = 5000,
+        consume: (InputStream, Long) -> T,
     ): T = withContext(Dispatchers.IO) {
         val connection = URL("https://127.0.0.1:${pairing.port}$path")
             .openConnection(Proxy.NO_PROXY) as HttpsURLConnection
@@ -177,7 +274,7 @@ internal class DaemonApi(private val pairing: Pairing) {
             connection.instanceFollowRedirects = false
             connection.useCaches = false
             connection.connectTimeout = 1800
-            connection.readTimeout = 5000
+            connection.readTimeout = timeout
             connection.setRequestProperty("Authorization", "Bearer ${pairing.key}")
             connection.setRequestProperty("Accept-Encoding", "identity")
             if (revision != null) connection.setRequestProperty("If-Match", revision)
@@ -205,13 +302,43 @@ internal class DaemonApi(private val pairing: Pairing) {
 
 private fun fileRoute(endpoint: String, scope: FileScope, path: String): String =
     "/v1/$endpoint?workspace=${encode(scope.workspace)}&path=${encode(path)}" +
-        (scope.run?.let { "&run=${encode(it)}" } ?: "")
+        (scope.run?.let { "&run=${encode(it)}" } ?: "") + (scope.thread?.let { "&thread=${encode(it)}" } ?: "")
 
 private fun encode(value: String): String = URLEncoder.encode(value, "UTF-8")
 
 private fun JSONObject.run(): Run = Run(getString("id"), getString("workspace"), getString("label"),
     getString("state"), if (isNull("exitCode")) null else getInt("exitCode"),
     if (isNull("branch")) null else getString("branch"), getBoolean("filesReady"))
+
+private fun JSONObject.optStringOrNull(key: String): String? = if (isNull(key) || !has(key)) null else getString(key)
+
+private fun JSONObject.thread(): AgentThread = AgentThread(
+    id = getString("id"), workspace = getString("workspace"), title = getString("title"), state = getString("state"),
+    mode = Mode.of(getString("mode")), provider = getString("provider"), providerLabel = getString("providerLabel"),
+    model = getString("model"), branch = optStringOrNull("branch"), filesReady = getBoolean("filesReady"),
+    runs = getInt("runs"), pendingCall = optStringOrNull("pendingCall"), additions = getInt("additions"),
+    deletions = getInt("deletions"), filesChanged = getInt("filesChanged"), inputTokens = getLong("inputTokens"),
+    outputTokens = getLong("outputTokens"), error = optStringOrNull("error"), updatedAt = getLong("updatedAt"),
+)
+
+private fun JSONObject.fileStat() = FileStat(getString("path"), getInt("additions"), getInt("deletions"), optBoolean("binary"))
+
+private fun JSONObject.threadItem(): ThreadItem? {
+    val id = getString("id")
+    val run = optInt("run")
+    return when (getString("kind")) {
+        "user" -> ThreadItem.User(id, run, getString("text"))
+        "text" -> ThreadItem.Text(id, run, getString("text"), optBoolean("streaming"))
+        "thinking" -> ThreadItem.Thinking(id, run, getString("text"), optBoolean("streaming"))
+        "tool" -> ThreadItem.Tool(id, run, optString("name"), optString("title"), optString("detail"),
+            optString("status"), optStringOrNull("output"), if (has("exitCode") && !isNull("exitCode")) getInt("exitCode") else null,
+            optStringOrNull("before"), optStringOrNull("after"), optBoolean("created"))
+        "notice" -> ThreadItem.Note(id, run, getString("text"), optString("tone") == "error")
+        "run" -> ThreadItem.RunEnd(id, run, optLong("duration"), optInt("additions"), optInt("deletions"),
+            optJSONArray("files")?.mapObjects { it.fileStat() }.orEmpty(), optBoolean("stopped"))
+        else -> null // Newer daemons may add kinds; skip what this app doesn't know.
+    }
+}
 
 private fun <T> JSONArray.mapObjects(transform: (JSONObject) -> T): List<T> =
     List(length()) { transform(getJSONObject(it)) }

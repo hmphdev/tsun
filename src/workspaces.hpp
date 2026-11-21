@@ -73,6 +73,7 @@ struct Configuration {
     std::string certificate;
     std::string private_key;
     std::string state_path;
+    Json raw; // the parsed config.json, for sections other modules own
 
     const Workspace& workspace(std::string_view id) const;
     Json catalog() const;
