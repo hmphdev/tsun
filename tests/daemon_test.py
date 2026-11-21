@@ -211,6 +211,7 @@ class DaemonTest(unittest.TestCase):
         self.process = subprocess.Popen(
             [str(DAEMON), str(self.state)], stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, encoding="utf-8",
+            env={k: v for k, v in os.environ.items() if k != "BRAVE_SEARCH_API_KEY"},
         )
         self.addCleanup(self.shutdown)
         with selectors.DefaultSelector() as selector:
@@ -293,6 +294,12 @@ class DaemonTest(unittest.TestCase):
         self.assertNotIn(b"argv", data)
         self.assertNotIn(os.fsencode(self.workspace), data)
         self.api("GET", "/v1/missing", status=404)
+        self.api("GET", "/v1/workspaces?overview=1", auth=False, status=401)
+        self.api("GET", "/v1/workspaces?overview=1&overview=1", status=400)
+        overview = self.api("GET", "/v1/workspaces?overview=1")
+        self.assertEqual(overview.pop("runs"), self.api("GET", "/v1/jobs"))
+        self.assertEqual(overview.pop("threads"), self.api("GET", "/v1/threads"))
+        self.assertEqual(overview, catalog)
 
     def test_tls_and_pairing_code(self):
         with self.assertRaises(ssl.SSLCertVerificationError):
@@ -511,7 +518,8 @@ class DaemonTest(unittest.TestCase):
         self.assertEqual(first["path"], "/v1/messages")
         self.assertEqual(first["headers"]["x-api-key"], "test-key")
         self.assertEqual({t["name"] for t in first["body"]["tools"]},
-                         {"bash", "read_file", "write_file", "edit_file", "list_files", "search", "delegate_task"})
+                         {"bash", "read_file", "write_file", "edit_file", "list_files", "search", "delegate_task",
+                          "message_session", "web_fetch", "web_search"})
         self.assertNotIn("eager_input_streaming", first["body"]["tools"][0])  # not the first-party API
         replayed = second["body"]["messages"][1]["content"]
         self.assertEqual(replayed[0], {"type": "thinking", "thinking": "Plan: write a file.", "signature": "sig-abc"})
@@ -743,6 +751,94 @@ class DaemonTest(unittest.TestCase):
         result = next(b for m in history if m["role"] == "user" for b in m["content"] if b["type"] == "tool_result")
         self.assertEqual(result["tool_use_id"], "toolu_child")
         self.assertTrue(result["is_error"])
+
+    def test_session_message_requires_approval_and_uses_the_targets_context(self):
+        self.model.script.append(openai_stream(content="I am ready."))
+        target_id = self.post("/v1/threads", {"workspace": "isolated", "provider": "local", "mode": "full",
+                              "prompt": "Target-only context"}, 201)["id"]
+        target, _ = self.thread_until(target_id, lambda t, _: t["state"] == "idle")
+        self.assertIsNone(target["error"])
+        self.model.script += [
+            openai_stream(calls=[("peer", "message_session", {"session_id": target_id, "message": "What is the first line?"})],
+                          finish="tool_calls"),
+            openai_stream(calls=[("read", "read_file", {"path": "notes.txt"}),
+                                 ("write", "write_file", {"path": "forbidden.txt", "content": "no"}),
+                                 ("cascade", "message_session", {"session_id": "a" * 24, "message": "Ping"})], finish="tool_calls"),
+            openai_stream(content="The first line is committed base."),
+            openai_stream(content="I heard back from the other session."),
+        ]
+        source_id = self.post("/v1/threads", {"workspace": "demo", "provider": "local", "mode": "full",
+                              "prompt": "Source-only context"}, 201)["id"]
+        source, _ = self.thread_until(source_id, lambda t, _: t["state"] == "waiting")
+        # Changing modes must not implicitly approve privacy-sensitive messages.
+        self.post(f"/v1/threads/{source_id}/settings", {"mode": "full"})
+        self.assertEqual(self.api("GET", f"/v1/threads/{target_id}")["thread"]["runs"], 1)
+        self.post(f"/v1/threads/{source_id}/approval", {"call": source["pendingCall"], "decision": "allow"})
+        source, items = self.thread_until(source_id, lambda t, _: t["state"] == "idle")
+        self.assertIsNone(source["error"])
+        tool = next(e for e in items if e.get("name") == "message_session")
+        self.assertEqual(tool["status"], "done")
+        self.assertIn("The first line is committed base.", tool["output"])
+        target_page = self.api("GET", f"/v1/threads/{target_id}")
+        self.assertEqual((target_page["thread"]["runs"], target_page["thread"]["mode"]), (2, "full"))
+        self.assertTrue(any(f"Message from session {source_id}" in e.get("text", "") for e in target_page["items"]))
+
+        target_request = self.model.requests[2]["body"]
+        self.assertEqual({t["function"]["name"] for t in target_request["tools"]}, {"read_file", "list_files"})
+        self.assertIn("Target-only context", json.dumps(target_request["messages"]))
+        self.assertNotIn("Source-only context", json.dumps(target_request["messages"]))
+        results = {m["tool_call_id"]: m["content"] for m in self.model.requests[3]["body"]["messages"] if m["role"] == "tool"}
+        self.assertIn("committed base", results["read"])
+        self.assertIn("can only read and list", results["write"])
+        self.assertIn("can only read and list", results["cascade"])
+        self.assertFalse((self.state / "worktrees" / f"isolated-{target_id}" / "forbidden.txt").exists())
+        returned = self.model.requests[4]["body"]["messages"][-1]
+        self.assertEqual(returned["content"], tool["output"])
+        self.assertNotIn("Target-only context", json.dumps(self.model.requests[4]["body"]["messages"]))
+
+        self.model.script.append(openai_stream(content="OK."))
+        self.post(f"/v1/threads/{target_id}/messages", {"text": "Back to work"}, 202)
+        self.thread_until(target_id, lambda t, _: t["state"] == "idle" and t["runs"] == 3)
+        self.assertNotIn("What is the first line?", json.dumps(self.model.requests[-1]["body"]["messages"]))
+
+    def test_stopping_a_session_message_cancels_the_targets_read_only_turn(self):
+        self.model.script.append(openai_stream(content="Ready."))
+        target_id = self.post("/v1/threads", {"workspace": "demo", "provider": "local", "prompt": "Target"}, 201)["id"]
+        self.thread_until(target_id, lambda t, _: t["state"] == "idle")
+        self.model.script += [
+            openai_stream(calls=[("peer", "message_session", {"session_id": target_id, "message": "Check the notes."})],
+                          finish="tool_calls"),
+            self.model.hang,
+        ]
+        source_id = self.post("/v1/threads", {"workspace": "demo", "provider": "local", "prompt": "Ask the target"}, 201)["id"]
+        source, _ = self.thread_until(source_id, lambda t, _: t["state"] == "waiting")
+        self.post(f"/v1/threads/{source_id}/approval", {"call": source["pendingCall"], "decision": "allow"})
+        deadline = time.monotonic() + 5
+        while len(self.model.requests) < 3:
+            self.assertLess(time.monotonic(), deadline, "the target model was never called")
+            time.sleep(0.02)
+        self.post(f"/v1/threads/{source_id}/interrupt", {})
+        source, items = self.thread_until(source_id, lambda t, _: t["state"] == "idle", timeout=5)
+        target, target_items = self.thread_until(target_id, lambda t, _: t["state"] == "idle", timeout=5)
+        self.assertIsNone(source["error"])
+        self.assertIsNone(target["error"])
+        self.assertEqual(next(e for e in items if e.get("name") == "message_session")["status"], "cancelled")
+        self.assertEqual(target_items[-1]["text"], "Stopped.")
+        self.assertEqual(len(self.model.requests), 3)
+
+    def test_web_tools_block_nonpublic_urls_and_report_when_search_is_unconfigured(self):
+        calls = [("loopback", "web_fetch", {"url": "http://127.0.0.1/"}),
+                 ("local_file", "web_fetch", {"url": "file:///etc/passwd"}),
+                 ("search", "web_search", {"query": "example documentation"})]
+        self.model.script += [openai_stream(calls=calls, finish="tool_calls"), openai_stream(content="Done.")]
+        thread_id = self.post("/v1/threads", {"workspace": "demo", "provider": "local", "mode": "full",
+                               "prompt": "Use the web tools"}, 201)["id"]
+        _, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle")
+        tools = [e for e in items if e["kind"] == "tool"]
+        self.assertEqual([e["status"] for e in tools], ["error", "error", "error"])
+        self.assertIn("Private and reserved", tools[0]["output"])
+        self.assertIn("public HTTP or HTTPS", tools[1]["output"])
+        self.assertIn("BRAVE_SEARCH_API_KEY", tools[2]["output"])
 
     def test_agent_interrupts_a_silent_model(self):
         self.model.script.append(self.model.hang)
