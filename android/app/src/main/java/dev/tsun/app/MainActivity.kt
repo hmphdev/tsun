@@ -1,10 +1,8 @@
 package dev.tsun.app
 
 import android.content.Context
-import android.graphics.Color
 import android.os.Bundle
 import androidx.activity.ComponentActivity
-import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.Box
@@ -26,10 +24,7 @@ import androidx.compose.ui.Modifier
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge(
-            statusBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
-            navigationBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
-        )
+        enableEdgeToEdge()
         val prefs = getSharedPreferences("local_pairing", Context.MODE_PRIVATE)
         val saved = Pairing.fromFields(prefs.getInt("port", 8787), prefs.getString("key", "").orEmpty(),
             prefs.getString("pin", "").orEmpty())
@@ -39,7 +34,7 @@ class MainActivity : ComponentActivity() {
                 var catalog by remember { mutableStateOf<Catalog?>(null) }
                 val palette = inks
                 Surface(Modifier.fillMaxSize(), color = palette.paper, contentColor = palette.ink) {
-                    Box(Modifier.fillMaxSize().emberBackground(palette)
+                    Box(Modifier.fillMaxSize()
                         .windowInsetsPadding(WindowInsets.systemBars.union(WindowInsets.displayCutout)).imePadding()) {
                         val local = pairing
                         if (local == null) {

@@ -363,7 +363,7 @@ private fun OutputBlock(text: String) {
     }
 }
 
-/** Old text in clay-red, new text in sage, like a small unified diff. */
+/** Old text in rust, new text in sage, like a small unified diff. */
 @Composable
 internal fun EditPreview(before: String, after: String) {
     val removed = if (before.isEmpty()) emptyList() else before.trimEnd('\n').lines()
