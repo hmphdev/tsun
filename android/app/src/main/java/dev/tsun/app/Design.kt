@@ -49,9 +49,11 @@ import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.ExperimentalTextApi
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontVariation
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.LineBreak
 import androidx.compose.ui.text.style.TextOverflow
@@ -91,7 +93,19 @@ private val Night = Inks(
 private val LocalInks = staticCompositionLocalOf { Day }
 internal val inks: Inks @Composable get() = LocalInks.current
 
-private val Reading = FontFamily(Font(R.font.newsreader))
+/**
+ * Newsreader ships as a single variable file (wght 200–800, opsz 6–72). Registering it once would
+ * let Compose resolve every bold request back to that one 400 face, so bold text and headings would
+ * render flat: the plain `Font(resId, …)` overload passes empty variation settings, so the `wght`
+ * axis is never touched. Registering the same file at each weight we use makes Android instantiate
+ * the axis per weight, and the entries stay distinct because [Font] equality includes them.
+ */
+@OptIn(ExperimentalTextApi::class)
+private fun reading(weight: Int) = Font(
+    R.font.newsreader, FontWeight(weight),
+    variationSettings = FontVariation.Settings(FontVariation.weight(weight)),
+)
+private val Reading = FontFamily(reading(400), reading(500), reading(600), reading(700))
 private val Interface = FontFamily(
     Font(R.font.source_sans_3_regular), Font(R.font.source_sans_3_semibold, FontWeight.SemiBold),
 )
