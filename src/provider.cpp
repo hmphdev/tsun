@@ -351,7 +351,7 @@ public:
     using Provider::Provider;
 
     Reply stream(const std::string& system, const std::vector<ToolSpec>& tools, const std::vector<Turn>& history,
-                 const StreamEvents& events, const std::atomic<bool>& cancel) const override {
+                 const StreamEvents& events, const std::atomic<bool>& cancel, const std::string& effort = {}) const override {
         // Eager input streaming is only for the first-party API; gateways may reject the field.
         const bool first_party = parse_endpoint(settings_.base_url).host == "api.anthropic.com";
         Json tool_list = Json::array();
@@ -370,7 +370,8 @@ public:
             {"cache_control", {{"type", "ephemeral"}}},
             {"thinking", {{"type", "adaptive"}, {"display", "summarized"}}},
         };
-        if (!settings_.effort.empty()) request["output_config"] = {{"effort", settings_.effort}};
+        const std::string level = effort.empty() ? settings_.effort : effort; // per-session /effort override
+        if (!level.empty()) request["output_config"] = {{"effort", level}};
         if (settings_.fallbacks) request["fallbacks"] = "default";
         request.update(settings_.extra_body);
 
@@ -581,7 +582,7 @@ public:
     using Provider::Provider;
 
     Reply stream(const std::string& system, const std::vector<ToolSpec>& tools, const std::vector<Turn>& history,
-                 const StreamEvents& events, const std::atomic<bool>& cancel) const override {
+                 const StreamEvents& events, const std::atomic<bool>& cancel, const std::string& effort = {}) const override {
         Json tool_list = Json::array();
         for (const auto& tool : tools) {
             tool_list.push_back({{"type", "function"}, {"function", {{"name", tool.name},
@@ -591,7 +592,8 @@ public:
             {"tools", std::move(tool_list)}};
         if (settings_.stream_usage) request["stream_options"] = {{"include_usage", true}};
         if (settings_.max_tokens > 0) request["max_tokens"] = settings_.max_tokens;
-        if (!settings_.effort.empty()) request["reasoning_effort"] = settings_.effort;
+        const std::string level = effort.empty() ? settings_.effort : effort; // per-session /effort override
+        if (!level.empty()) request["reasoning_effort"] = level;
         request.update(settings_.extra_body);
 
         httplib::Headers headers{{"accept", "text/event-stream"}};
@@ -744,7 +746,7 @@ ProviderSet load_providers(const Json& config, const std::string& state_path) {
     const auto agent = config.value("agent", Json::object());
     if (!agent.is_object()) throw std::runtime_error("agent must be an object");
     auto entries = agent.value("providers", Json::array());
-    if (!entries.is_array() || entries.size() > 16) throw std::runtime_error("agent.providers must be an array of up to 16 providers");
+    if (!entries.is_array() || entries.size() > 32) throw std::runtime_error("agent.providers must be an array of up to 32 providers");
     // With no list, offer Claude through the Anthropic API.
     if (entries.empty()) entries.push_back({{"id", "claude"}, {"kind", "anthropic"}, {"label", "Claude Opus 5.5"}});
     std::set<std::string> ids;

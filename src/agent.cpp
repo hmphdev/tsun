@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <set>
 #include <sstream>
 
 namespace tsun {
@@ -69,6 +70,8 @@ std::string checked_mode(const std::string& mode) {
     if (mode != "ask" && mode != "edits" && mode != "full") throw Error(400, "Mode must be ask, edits, or full");
     return mode;
 }
+
+const std::set<std::string> effort_levels{"minimal", "low", "medium", "high", "xhigh", "max"};
 
 std::string first_line(const std::string& text) {
     return trimmed(text.substr(0, text.find('\n')));
@@ -164,6 +167,7 @@ struct Agents::Thread {
     std::shared_ptr<const FileRoot> root;           // where tools run, once ready
     std::string mode = "edits";
     std::string provider_id;
+    std::string effort;               // per-session /effort override; empty = provider config
     std::string state = "idle"; // preparing, running, waiting, idle
     std::string error;
     std::vector<Turn> history;
@@ -235,7 +239,7 @@ Json Agents::summary(const Thread& thread) const {
     const auto* provider = providers_.find(thread.provider_id);
     return {
         {"id", thread.id}, {"workspace", thread.workspace}, {"title", thread.title}, {"state", thread.state},
-        {"mode", thread.mode}, {"provider", thread.provider_id},
+        {"mode", thread.mode}, {"provider", thread.provider_id}, {"effort", thread.effort.empty() ? Json(nullptr) : Json(thread.effort)},
         {"providerLabel", provider ? provider->settings().label : thread.provider_id},
         {"model", provider ? provider->settings().model : ""},
         {"branch", thread.branch.empty() ? Json(nullptr) : Json(thread.branch)},
@@ -387,8 +391,41 @@ Json Agents::send(std::string_view id, const Json& body) {
                 {"text", "Switched to " + provider->settings().label + ". The conversation so far carries over."}});
         }
     }
+    // /effort is a session command, not a message for the model.
+    if (effort_command(*thread, text)) return summary(*thread);
     start_run(thread, std::move(text));
     return summary(*thread);
+}
+
+bool Agents::effort_command(Thread& thread, const std::string& text) {
+    // Called with mutex_ held and the thread idle.
+    if (text.rfind("/effort", 0) != 0) return false;
+    const auto rest = text.substr(7);
+    if (!rest.empty() && static_cast<unsigned char>(rest[0]) > ' ') return false; // /effort… is a message
+    const auto level = trimmed(rest);
+    const auto* provider = providers_.find(thread.provider_id);
+    const auto configured = provider ? provider->settings().effort : std::string{};
+    const auto current = thread.effort.empty() ? configured : thread.effort;
+    if (level.empty()) {
+        add_item(thread, {{"kind", "notice"}, {"tone", "info"},
+            {"text", "Reasoning effort: " + current +
+                (thread.effort.empty() ? " (provider default)" : " (set for this session)") +
+                ". Levels: minimal, low, medium, high, xhigh, max. Use /effort <level> or /effort default."}});
+    } else if (level == "default" || level == "reset") {
+        thread.effort.clear();
+        add_item(thread, {{"kind", "notice"}, {"tone", "info"},
+            {"text", "Reasoning effort reset to the provider default" +
+                (configured.empty() ? "." : " (" + configured + ").")}});
+    } else if (!effort_levels.contains(level)) {
+        add_item(thread, {{"kind", "notice"}, {"tone", "error"},
+            {"text", "Unknown effort level '" + level + "'. Levels: minimal, low, medium, high, xhigh, max."}});
+    } else {
+        thread.effort = level;
+        add_item(thread, {{"kind", "notice"}, {"tone", "info"},
+            {"text", "Reasoning effort set to " + level + " for this session."}});
+    }
+    thread.updated_at = now_ms();
+    return true;
 }
 
 Json Agents::update(std::string_view id, const Json& body) {
@@ -576,11 +613,13 @@ void Agents::run_steps(Thread& thread) {
     for (int step = 0; step < (peer ? 8 : max_steps); ++step) {
         std::vector<Turn> history;
         const Provider* provider = nullptr;
+        std::string effort;
         {
             const std::lock_guard lock(mutex_);
             if (thread.cancel) break;
             provider = providers_.find(thread.provider_id);
             history = thread.history;
+            effort = thread.effort;
         }
         if (!provider || !provider->settings().enabled()) throw std::runtime_error("The selected model provider is not available");
 
@@ -633,7 +672,7 @@ void Agents::run_steps(Thread& thread) {
 
         Reply reply;
         try {
-            reply = provider->stream(system, tools, history, events, thread.cancel);
+            reply = provider->stream(system, tools, history, events, thread.cancel, effort);
         } catch (const ProviderError& error) {
             const std::lock_guard lock(mutex_);
             // Close streaming items and keep any visible text as context for the next run.
@@ -748,7 +787,7 @@ void Agents::run_steps(Thread& thread) {
                     const ToolContext context{root, root_path, thread.cancel};
                     const bool delegated = call.name == "delegate_task";
                     if (delegated) --remaining_delegates;
-                    const auto outcome = delegated ? run_delegate(context, call, *provider, guidance)
+                    const auto outcome = delegated ? run_delegate(context, call, *provider, guidance, effort)
                         : call.name == "message_session" ? message_session(thread, call) : run_tool(context, call);
                     lock.lock();
                     thread.input_tokens += outcome.input_tokens;

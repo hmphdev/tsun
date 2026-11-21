@@ -41,6 +41,7 @@ private:
     struct PeerRequest;
 
     std::shared_ptr<Thread> find(std::string_view id) const;
+    bool effort_command(Thread& thread, const std::string& text);
     void start_run(const std::shared_ptr<Thread>& thread, std::string prompt, std::shared_ptr<PeerRequest> peer = {});
     ToolOutcome message_session(Thread& source, const ToolCall& call);
     void work(std::shared_ptr<Thread> thread);

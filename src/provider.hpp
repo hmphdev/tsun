@@ -94,9 +94,11 @@ public:
     std::string owner() const { return settings_.id + "/" + settings_.model; }
 
     // Blocking. Retries transient failures that happen before any output.
+    // An empty `effort` uses the provider's configured level; a thread can
+    // override it per session (the /effort command) without new config.
     virtual Reply stream(const std::string& system, const std::vector<ToolSpec>& tools,
                          const std::vector<Turn>& history, const StreamEvents& events,
-                         const std::atomic<bool>& cancel) const = 0;
+                         const std::atomic<bool>& cancel, const std::string& effort = {}) const = 0;
 
 protected:
     ProviderSettings settings_;

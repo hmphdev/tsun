@@ -546,7 +546,7 @@ ToolOutcome run_tool(const ToolContext& context, const ToolCall& call) {
 }
 
 ToolOutcome run_delegate(const ToolContext& context, const ToolCall& call, const Provider& provider,
-                         const std::string& workspace_guidance) {
+                         const std::string& workspace_guidance, const std::string& effort) {
     const auto& tools = inspection_tools();
     const std::string system =
         "You are Tsun's read-only subagent. Investigate the delegated task using read_file and list_files. "
@@ -589,7 +589,7 @@ ToolOutcome run_delegate(const ToolContext& context, const ToolCall& call, const
         if (interrupted()) return interruption();
         Reply reply;
         try {
-            reply = provider.stream(system, tools, history, {}, cancel);
+            reply = provider.stream(system, tools, history, {}, cancel, effort);
         } catch (const ProviderError& error) {
             if (interrupted()) return interruption();
             return finish(std::string("Subagent request failed: ") + error.what(), true);

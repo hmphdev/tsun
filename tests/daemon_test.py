@@ -558,6 +558,44 @@ class DaemonTest(unittest.TestCase):
         self.assertEqual(self.git(self.repo, "for-each-ref", "--format=%(refname)", "refs/tsun/").splitlines()[-1],
                          f"refs/tsun/checkpoints/{thread_id}/2")
 
+    def test_effort_command_overrides_reasoning_effort(self):
+        self.model.script += [
+            anthropic_stream([{"type": "text", "text": "First reply."}], "end_turn"),
+            anthropic_stream([{"type": "text", "text": "Low reply."}], "end_turn"),
+            openai_stream(content="Xhigh reply."),
+        ]
+        thread = self.post("/v1/threads", {"workspace": "demo", "prompt": "Hi"}, 201)
+        thread_id = thread["id"]
+        thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle")
+        self.assertEqual(self.model.requests[0]["body"]["output_config"], {"effort": "high"})  # provider default
+
+        # Unknown levels are rejected with an error notice; nothing is sent to the model.
+        self.post(f"/v1/threads/{thread_id}/messages", {"text": "/effort turbo"}, 202)
+        thread, items = self.thread_until(thread_id, lambda t, i: any(
+            e["kind"] == "notice" and e.get("tone") == "error" and "turbo" in e["text"] for e in i))
+        self.assertEqual(thread["runs"], 1)
+
+        # A level applies to that session without starting a run.
+        self.post(f"/v1/threads/{thread_id}/messages", {"text": "/effort low"}, 202)
+        thread, items = self.thread_until(thread_id, lambda t, _: t["effort"] == "low")
+        self.assertIn("Reasoning effort set to low", [e["text"] for e in items if e["kind"] == "notice"][-1])
+        self.assertEqual(thread["runs"], 1)
+
+        self.post(f"/v1/threads/{thread_id}/messages", {"text": "go"}, 202)
+        thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle" and t["runs"] == 2)
+        self.assertEqual(self.model.requests[1]["body"]["output_config"], {"effort": "low"})
+
+        # The override survives a provider switch and maps to reasoning_effort.
+        self.post(f"/v1/threads/{thread_id}/messages", {"text": "/effort xhigh", "provider": "local"}, 202)
+        self.post(f"/v1/threads/{thread_id}/messages", {"text": "go again"}, 202)
+        thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle" and t["runs"] == 3)
+        self.assertEqual(self.model.requests[2]["body"]["reasoning_effort"], "xhigh")
+
+        # /effort default clears the override; /efforts without a space stays a normal message.
+        self.post(f"/v1/threads/{thread_id}/messages", {"text": "/effort default"}, 202)
+        thread, items = self.thread_until(thread_id, lambda t, _: t["effort"] is None)
+        self.assertIn("reset to the provider default", [e["text"] for e in items if e["kind"] == "notice"][-1])
+
     def test_agent_denials_confinement_and_interrupt(self):
         self.model.script += [
             anthropic_stream([

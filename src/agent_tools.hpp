@@ -34,6 +34,6 @@ Json describe_call(const ToolCall& call, const std::string& root_path);
 ToolOutcome run_tool(const ToolContext& context, const ToolCall& call);
 // Foreground, read-only delegation on the parent's model and workspace.
 ToolOutcome run_delegate(const ToolContext& context, const ToolCall& call, const Provider& provider,
-                         const std::string& workspace_guidance);
+                         const std::string& workspace_guidance, const std::string& effort = {});
 
 } // namespace tsun
