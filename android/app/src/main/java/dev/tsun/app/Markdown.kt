@@ -1,6 +1,7 @@
 package dev.tsun.app
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -15,6 +16,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.produceState
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
@@ -27,6 +29,7 @@ import androidx.compose.ui.text.TextLinkStyles
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.withLink
 import androidx.compose.ui.text.withStyle
@@ -43,12 +46,45 @@ private sealed interface Block {
     data class Bullet(val marker: String, val text: String, val depth: Int) : Block
     data class Quote(val text: String) : Block
     data class Code(val language: String, val text: String) : Block
+    data class Table(val header: List<String>, val aligns: List<CellAlign>, val rows: List<List<String>>) : Block
     data object Rule : Block
 }
+
+private enum class CellAlign { Start, Center, End }
 
 private val orderedItem = Regex("^(\\s*)(\\d{1,3})[.)]\\s+(.*)$")
 private val bulletItem = Regex("^(\\s*)[-*+]\\s+(.*)$")
 private val heading = Regex("^(#{1,4})\\s+(.*)$")
+private val tableDivider = Regex("^\\|?\\s*:?-+:?\\s*(\\|\\s*:?-+:?\\s*)*\\|?$")
+
+/** True when the line looks like a table row rather than prose that happens to hold a pipe. */
+private fun tableRow(line: String): Boolean {
+    val trimmed = line.trim()
+    return trimmed.contains('|') && trimmed.isNotEmpty()
+}
+
+/** Splits on unescaped pipes; `\|` stays a literal pipe inside the cell. */
+private fun splitRow(line: String): List<String> {
+    val body = line.trim().removePrefix("|").removeSuffix("|")
+    val cells = mutableListOf<String>()
+    val cell = StringBuilder()
+    var i = 0
+    while (i < body.length) {
+        when {
+            body[i] == '\\' && i + 1 < body.length && body[i + 1] == '|' -> { cell.append('|'); i += 2 }
+            body[i] == '|' -> { cells += cell.toString().trim(); cell.clear(); i++ }
+            else -> { cell.append(body[i]); i++ }
+        }
+    }
+    cells += cell.toString().trim()
+    return cells
+}
+
+private fun alignment(cell: String): CellAlign = when {
+    cell.startsWith(":") && cell.endsWith(":") -> CellAlign.Center
+    cell.endsWith(":") -> CellAlign.End
+    else -> CellAlign.Start
+}
 
 private fun parse(markdown: String): List<Block> {
     val blocks = mutableListOf<Block>()
@@ -78,6 +114,21 @@ private fun parse(markdown: String): List<Block> {
                 blocks += Block.Heading(match.groupValues[1].length, match.groupValues[2])
             }
             trimmed == "---" || trimmed == "***" -> { flush(); blocks += Block.Rule }
+            tableRow(line) && i + 1 < lines.size && tableDivider.matches(lines[i + 1].trim()) -> {
+                flush()
+                val header = splitRow(line)
+                val spans = splitRow(lines[i + 1])
+                val aligns = List(header.size) { c -> alignment(spans.getOrElse(c) { "" }) }
+                val rows = mutableListOf<List<String>>()
+                var j = i + 2
+                while (j < lines.size && tableRow(lines[j]) && !tableDivider.matches(lines[j].trim())) {
+                    val cells = splitRow(lines[j])
+                    rows += List(header.size) { c -> cells.getOrElse(c) { "" } }
+                    j++
+                }
+                blocks += Block.Table(header, aligns, rows)
+                i = j - 1
+            }
             bulletItem.matches(line) -> {
                 flush()
                 val match = bulletItem.find(line)!!
@@ -131,7 +182,7 @@ private fun inline(text: String, code: Color, codeBackground: Color, link: Color
                 val marker = text.substring(i, i + 2)
                 val end = text.indexOf(marker, i + 2)
                 if (end > i + 2) {
-                    withStyle(SpanStyle(fontWeight = FontWeight.SemiBold)) { append(inline(text.substring(i + 2, end), code, codeBackground, link)) }
+                    withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(inline(text.substring(i + 2, end), code, codeBackground, link)) }
                     i = end + 2
                 } else { append(c); i++ }
             }
@@ -179,7 +230,7 @@ internal fun MarkdownText(markdown: String, modifier: Modifier = Modifier) {
                     is Block.Heading -> block.text
                     is Block.Bullet -> block.text
                     is Block.Quote -> block.text
-                    is Block.Code, Block.Rule -> null
+                    is Block.Code, Block.Rule, is Block.Table -> null
                 }
                 block to (text?.let { inline(it, palette.ink, palette.wash, palette.accent) } ?: AnnotatedString(""))
             }
@@ -199,8 +250,59 @@ internal fun MarkdownText(markdown: String, modifier: Modifier = Modifier) {
                 drawRect(palette.rule, size = Size(2.dp.toPx(), size.height))
             }.padding(start = 12.dp), style = ProseType.copy(fontStyle = FontStyle.Italic), color = palette.quiet)
             is Block.Code -> CodeBlock(block.text, block.language)
+            is Block.Table -> TableBlock(block)
             Block.Rule -> Box(Modifier.fillMaxWidth().padding(vertical = 4.dp).height(1.dp).background(palette.rule))
         }
+    }
+}
+
+@Composable
+private fun TableBlock(table: Block.Table) {
+    val palette = inks
+    val header = remember(table, palette) { table.header.map { inline(it, palette.ink, palette.wash, palette.accent) } }
+    val rows = remember(table, palette) {
+        table.rows.map { row -> row.map { inline(it, palette.ink, palette.wash, palette.accent) } }
+    }
+    val weights = remember(table) { columnWeights(table.header, table.rows) }
+    val shape = RoundedCornerShape(10.dp)
+    Column(Modifier.fillMaxWidth().clip(shape).border(1.dp, palette.rule, shape)) {
+        TableRow(header, table.aligns, weights, palette, header = true)
+        for (row in rows) {
+            Box(Modifier.fillMaxWidth().height(1.dp).background(palette.rule))
+            TableRow(row, table.aligns, weights, palette, header = false)
+        }
+    }
+}
+
+@Composable
+private fun TableRow(
+    cells: List<AnnotatedString>, aligns: List<CellAlign>, weights: List<Float>, palette: Inks, header: Boolean,
+) {
+    Row(Modifier.fillMaxWidth().background(if (header) palette.wash else Color.Transparent)
+        .padding(horizontal = 12.dp, vertical = 9.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        cells.forEachIndexed { column, text ->
+            val align = aligns.getOrElse(column) { CellAlign.Start }
+            Text(text, Modifier.weight(weights.getOrElse(column) { 1f }),
+                style = ProseType.copy(
+                    fontSize = 14.5.sp, lineHeight = 20.sp,
+                    fontWeight = if (header) FontWeight.SemiBold else FontWeight.Normal,
+                ),
+                textAlign = when (align) {
+                    CellAlign.Start -> TextAlign.Start
+                    CellAlign.Center -> TextAlign.Center
+                    CellAlign.End -> TextAlign.End
+                },
+                color = if (header) palette.ink else palette.quiet)
+        }
+    }
+}
+
+/** Wider columns get proportionally more room, so a "file | status" table does not wrap its names. */
+private fun columnWeights(header: List<String>, rows: List<List<String>>): List<Float> {
+    if (header.isEmpty()) return emptyList()
+    return header.indices.map { column ->
+        (rows.mapNotNull { it.getOrNull(column)?.length } + header[column].length)
+            .maxOrNull()?.toFloat()?.coerceIn(6f, 36f) ?: 6f
     }
 }
 
