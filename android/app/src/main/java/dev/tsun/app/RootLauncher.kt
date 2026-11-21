@@ -39,7 +39,7 @@ internal object RootLauncher {
     }
 
     private suspend fun readPairing(): Pairing {
-        val output = asRoot("$login $binary --pairing-code $state")
+        val output = asRoot("Read Debian pairing", "$login $binary --pairing-code $state")
         return output.lineSequence().mapNotNull { Pairing.parse(it) }.singleOrNull()
             ?: throw RootLaunchError("Could not read Tsun's pairing from the Debian chroot. Check the daemon and state paths.")
     }
@@ -49,7 +49,7 @@ internal object RootLauncher {
         // su session and lock the state so two app opens cannot both launch it.
         val guest = "umask 077; exec $binary $state > $state/launcher.log 2>&1"
         val launch = "$login /usr/bin/flock -n -o $state/launcher.lock /bin/sh -c ${quote(guest)}"
-        asRoot("/system/bin/setsid $launch </dev/null >/dev/null 2>&1 &")
+        asRoot("Start Debian daemon", "/system/bin/setsid $launch </dev/null >/dev/null 2>&1 &")
         return withTimeoutOrNull(15_000L) { awaitOverview(api) }
             ?: throw RootLaunchError("Debian did not start Tsun. Check $state/launcher.log in Debian.")
     }
@@ -63,12 +63,14 @@ internal object RootLauncher {
 
     private fun quote(value: String): String = "'" + value.replace("'", "'\\''") + "'"
 
-    private suspend fun asRoot(command: String): String = runInterruptible(Dispatchers.IO) {
+    private suspend fun asRoot(step: String, command: String): String = runInterruptible(Dispatchers.IO) {
         // Only fixed launcher commands reach su. No intents, model output or user text are shell input.
-        val checked = "[ \"\$(/system/bin/id -u)\" = 0 ] || exit 77; $command"
-        // On KernelSU sucompat, su can exist only at exec time, so don't probe it with File.exists().
+        val checked = "[ \"\$(/system/bin/id -u)\" = 0 ] || exit 77; " +
+            "[ -x $prefix/bin/chroot-distro ] || exit 78; $command"
+        // On KernelSU sucompat, su can exist only at exec time. Use -M so root sees
+        // Termux's files rather than inheriting Android's app-private mount namespace.
         val process = try {
-            ProcessBuilder("/system/bin/sh", "-c", "exec /system/bin/su -c ${quote(checked)}")
+            ProcessBuilder("/system/bin/sh", "-c", "exec /system/bin/su -M -c ${quote(checked)}")
                 .redirectErrorStream(true).start()
         } catch (_: IOException) {
             throw RootLaunchError("Could not open the root launcher. Grant Tsun root in your root manager.")
@@ -92,8 +94,12 @@ internal object RootLauncher {
                     }
                 } while (!process.waitFor(50, TimeUnit.MILLISECONDS) || input.available() > 0)
             }
-            if (process.exitValue() != 0) {
-                throw RootLaunchError("Root launcher failed. Grant Tsun root in your root manager and check that Debian has the built daemon and state directory.")
+            when (val status = process.exitValue()) {
+                0 -> Unit
+                77 -> throw RootLaunchError("KernelSU did not grant Tsun UID 0. Check its root profile.")
+                78 -> throw RootLaunchError("Root cannot see Termux's chroot-distro. Check that it is installed and visible in the global mount namespace.")
+                126, 127 -> throw RootLaunchError("Couldn't execute the root launcher ($step, exit $status). Check KernelSU and the Termux installation.")
+                else -> throw RootLaunchError("$step failed (exit $status). Check the Debian container, built daemon, and state directory.")
             }
             // The output may contain the pairing key. Never log it or put it in an error message.
             output.toString(Charsets.UTF_8.name())
