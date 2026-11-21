@@ -98,6 +98,13 @@ private fun parse(markdown: String): List<Block> {
     while (i < lines.size) {
         val line = lines[i]
         val trimmed = line.trimStart()
+        // GFM rejects a delimiter row whose cell count differs from the header's. Checking it here also
+        // keeps prose that mentions a pipe, followed by a "---" rule, from being read as a one-row table.
+        val table = if (tableRow(line) && i + 1 < lines.size && tableDivider.matches(lines[i + 1].trim())) {
+            val header = splitRow(line)
+            val spans = splitRow(lines[i + 1])
+            if (spans.size == header.size) header to spans else null
+        } else null
         when {
             trimmed.startsWith("```") || trimmed.startsWith("~~~") -> {
                 flush()
@@ -114,10 +121,9 @@ private fun parse(markdown: String): List<Block> {
                 blocks += Block.Heading(match.groupValues[1].length, match.groupValues[2])
             }
             trimmed == "---" || trimmed == "***" -> { flush(); blocks += Block.Rule }
-            tableRow(line) && i + 1 < lines.size && tableDivider.matches(lines[i + 1].trim()) -> {
+            table != null -> {
                 flush()
-                val header = splitRow(line)
-                val spans = splitRow(lines[i + 1])
+                val (header, spans) = table
                 val aligns = List(header.size) { c -> alignment(spans.getOrElse(c) { "" }) }
                 val rows = mutableListOf<List<String>>()
                 var j = i + 2
