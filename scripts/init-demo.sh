@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if (( $# > 1 )); then
-    printf 'Usage: %s [DEMO_DIRECTORY]\n' "$0" >&2
+samples=false
+if [[ ${1:-} == --samples ]]; then
+    samples=true
+    shift
+fi
+if (( $# > 1 )) || [[ ${1:-} == -* ]]; then
+    printf 'Usage: %s [--samples] [DEMO_DIRECTORY]\n' "$0" >&2
     exit 2
 fi
 
@@ -16,14 +21,16 @@ if ! mkdir -- "$target"; then
 fi
 target=$(cd -- "$target" && pwd -P)
 state="$target/state"
-mkdir -- "$state"
-cp -R -- "$repo/examples/workspace" "$target/workspace"
+mkdir -- "$state" "$target/workspace"
+if [[ $samples == true ]]; then
+    cp -R -- "$repo/examples/workspace/." "$target/workspace/"
+fi
 
-# Worktree tasks branch from a committed snapshot of the demo files.
+# A committed HEAD is required even when the workspace starts empty.
 git -C "$target/workspace" init -q --initial-branch=main --template=
 git -C "$target/workspace" -c core.hooksPath=/dev/null add -- .
 git -C "$target/workspace" -c core.hooksPath=/dev/null -c commit.gpgsign=false \
-    -c user.name='Tsun Demo' -c user.email='tsun-demo@example.invalid' commit -qm 'Initialize demo workspace'
+    -c user.name='Tsun Demo' -c user.email='tsun-demo@example.invalid' commit --allow-empty -qm 'Initialize demo workspace'
 
 openssl rand -hex 32 > "$state/token"
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
@@ -31,14 +38,17 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
     -addext 'subjectAltName=IP:127.0.0.1' -addext 'extendedKeyUsage=serverAuth' \
     -keyout "$state/key.pem" -out "$state/cert.pem"
 
-python3 - "$repo/examples/config.json" "$state/config.json" "$target/workspace" <<'PY'
+python3 - "$repo/examples/config.json" "$state/config.json" "$target/workspace" "$samples" <<'PY'
 import json
 from pathlib import Path
 import sys
 
-source, destination, workspace = sys.argv[1:]
+source, destination, workspace, samples = sys.argv[1:]
 config = json.loads(Path(source).read_text(encoding="utf-8"))
-config["workspaces"][0]["root"] = workspace
+project = config["workspaces"][0]
+project["root"] = workspace
+if samples != "true":
+    project.update(label="Workspace", commands=[])
 Path(destination).write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
 PY
 
