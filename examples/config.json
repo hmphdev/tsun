@@ -1,5 +1,26 @@
 {
   "port": 8787,
+  "agent": {
+    "default": "claude",
+    "providers": [
+      {
+        "id": "claude",
+        "kind": "anthropic",
+        "label": "Claude Opus 5.5",
+        "model": "claude-opus-5-5",
+        "effort": "high"
+      },
+      {
+        "id": "local",
+        "kind": "openai",
+        "label": "Local model (Ollama)",
+        "baseUrl": "http://127.0.0.1:11434/v1",
+        "model": "your-model-name",
+        "apiKeyEnv": "",
+        "enabled": false
+      }
+    ]
+  },
   "workspaces": [
     {
       "id": "field-notes",
@@ -9,12 +30,20 @@
         {
           "id": "report",
           "label": "Demo report",
-          "argv": ["/bin/sh", "-c", "printf 'Workspace: %s\\n' \"$PWD\"; for step in indexing gathering formatting rendering; do printf 'Report: %s\\n' \"$step\"; /bin/sleep 8; done; printf 'Open artifacts/report.html in Files.\\n'"]
+          "argv": [
+            "/bin/sh",
+            "-c",
+            "printf 'Workspace: %s\\n' \"$PWD\"; for step in indexing gathering formatting rendering; do printf 'Report: %s\\n' \"$step\"; /bin/sleep 8; done; printf 'Open artifacts/report.html in Files.\\n'"
+          ]
         },
         {
           "id": "check",
           "label": "Demo checks",
-          "argv": ["/bin/sh", "-c", "for step in files preview export; do printf 'Checking %s…\\n' \"$step\"; /bin/sleep 10; done; printf 'Demo checks complete.\\n'"]
+          "argv": [
+            "/bin/sh",
+            "-c",
+            "for step in files preview export; do printf 'Checking %s…\\n' \"$step\"; /bin/sleep 10; done; printf 'Demo checks complete.\\n'"
+          ]
         }
       ]
     }

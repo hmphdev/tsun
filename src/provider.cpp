@@ -144,6 +144,18 @@ void post_stream(const ProviderSettings& settings, const std::string& path, http
         parser.reset();
         SseReader reader;
         std::optional<ProviderError> failure;
+        // A model can stay silent for minutes while it reasons. Shut the socket
+        // down as soon as the run is interrupted instead of waiting for a chunk.
+        std::atomic<bool> finished{false};
+        std::thread watcher([&] {
+            while (!finished.load()) {
+                if (cancel.load()) {
+                    client.stop();
+                    return;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        });
         auto result = client.Post(endpoint.path + path, headers, payload, "application/json",
             [&](const char* data, std::size_t length) {
                 if (cancel.load()) return false;
@@ -155,6 +167,8 @@ void post_stream(const ProviderSettings& settings, const std::string& path, http
                 }
                 return true;
             });
+        finished = true;
+        watcher.join();
         if (cancel.load()) throw ProviderError("Interrupted", false, parser.streamed());
         if (!failure) {
             if (!result) {

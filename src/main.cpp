@@ -240,7 +240,7 @@ int serve(const tsun::Configuration& config, httplib::SSLServer& server) {
         const auto wait = std::min<std::uint64_t>(number_query(req, "wait", 0), 2000);
         respond(res, agents.read(req.matches[1].str(), number_query(req, "since", 0), std::chrono::milliseconds(wait)));
     });
-    server.Patch(thread_route, [&](const Request& req, Response& res) {
+    server.Post(std::string(thread_route) + "/settings", [&](const Request& req, Response& res) {
         respond(res, agents.update(req.matches[1].str(), object_body(req)));
     });
     server.Post(std::string(thread_route) + "/messages", [&](const Request& req, Response& res) {

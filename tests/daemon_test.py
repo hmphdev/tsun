@@ -104,7 +104,10 @@ class MockProvider:
                 self.end_headers()
                 self.wfile.write(reply)
 
+        self.release = threading.Event()
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.server.block_on_close = False
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
 
@@ -112,7 +115,12 @@ class MockProvider:
     def url(self):
         return f"http://127.0.0.1:{self.server.server_address[1]}"
 
+    def hang(self, _body):
+        self.release.wait(20)  # a model that says nothing for a long time
+        return None
+
     def close(self):
+        self.release.set()
         self.server.shutdown()
         self.server.server_close()
 
@@ -563,8 +571,7 @@ class DaemonTest(unittest.TestCase):
 
         # Widening the mode answers the next request; then Stop kills the running command.
         thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "waiting")
-        self.api("PATCH", f"/v1/threads/{thread_id}", headers={"Content-Type": "application/json"},
-                 body=json.dumps({"mode": "full"}))
+        self.post(f"/v1/threads/{thread_id}/settings", {"mode": "full"})
         self.thread_until(thread_id, lambda t, i: any(e.get("call") == "toolu_e" and e["status"] == "running" for e in i))
         started = time.monotonic()
         self.post(f"/v1/threads/{thread_id}/interrupt", {})
@@ -586,6 +593,20 @@ class DaemonTest(unittest.TestCase):
         self.assertEqual([r["tool_use_id"] for r in results], ["toolu_a", "toolu_b", "toolu_c", "toolu_d", "toolu_e"])
         self.assertTrue(all(r.get("is_error") for r in results))
         self.assertEqual(history[-1]["content"][-1], {"type": "text", "text": "Never mind"})
+
+    def test_agent_interrupts_a_silent_model(self):
+        self.model.script.append(self.model.hang)
+        thread_id = self.post("/v1/threads", {"workspace": "demo", "prompt": "Think hard"}, 201)["id"]
+        deadline = time.monotonic() + 5
+        while not self.model.requests:
+            self.assertLess(time.monotonic(), deadline, "the model was never called")
+            time.sleep(0.02)
+        started = time.monotonic()
+        self.post(f"/v1/threads/{thread_id}/interrupt", {})
+        thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle", timeout=5)
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertIsNone(thread["error"])
+        self.assertEqual(items[-2]["text"], "Stopped.")
 
     def test_agent_reports_provider_errors(self):
         thread_id = self.post("/v1/threads", {"workspace": "demo", "prompt": "Hello"}, 201)["id"]

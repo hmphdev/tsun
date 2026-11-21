@@ -104,8 +104,8 @@ private fun DirectoryPage(
         finally { refreshing = false }
     }
     Column(Modifier.fillMaxSize().padding(horizontal = 21.dp)) {
-        Eyebrow(if (scope.run != null) "TASK WORKTREE" else "PROJECT CHECKOUT",
-            Modifier.padding(top = 23.dp), color = inks.pine)
+        Eyebrow(if (scope.run != null || scope.thread != null) "TASK WORKTREE" else "PROJECT CHECKOUT",
+            Modifier.padding(top = 23.dp), color = inks.accent)
         Text(title, Modifier.padding(top = 6.dp), style = MaterialTheme.typography.headlineMedium,
             maxLines = 2, overflow = TextOverflow.Ellipsis)
         branch?.let {
@@ -114,7 +114,7 @@ private fun DirectoryPage(
         }
         Row(Modifier.fillMaxWidth().padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
             GlyphButton(Glyph.Back, if (path.isEmpty()) "Back to runs" else "Parent folder", onClick = up)
-            Text(path.ifEmpty { if (scope.run != null) "Worktree root" else "Project root" }, Modifier.weight(1f),
+            Text(path.ifEmpty { if (scope.run != null || scope.thread != null) "Worktree root" else "Project root" }, Modifier.weight(1f),
                 style = if (path.isEmpty()) MaterialTheme.typography.bodyMedium else CodeType,
                 color = inks.quiet, maxLines = 1, overflow = TextOverflow.Ellipsis)
             GlyphButton(Glyph.Refresh, "Refresh folder", enabled = !refreshing) { reload++ }
@@ -139,7 +139,7 @@ private fun DirectoryPage(
                     Row(Modifier.fillMaxWidth().clickable(role = Role.Button) { select(entry) }
                         .heightIn(min = 54.dp).padding(horizontal = 2.dp, vertical = 7.dp),
                         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(11.dp)) {
-                        LineIcon(icon, color = if (entry.directory) inks.pine else inks.quiet, size = 19)
+                        LineIcon(icon, color = if (entry.directory) inks.accent else inks.quiet, size = 19)
                         Text(entry.name, Modifier.weight(1f), style = MaterialTheme.typography.titleSmall,
                             maxLines = 2, overflow = TextOverflow.Ellipsis)
                         if (!entry.directory) {
@@ -265,7 +265,7 @@ private fun FilePage(
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             GlyphButton(Glyph.Back, "Back to folder", enabled = action == null) { guard(close) }
             Column(Modifier.weight(1f).padding(horizontal = 4.dp)) {
-                Eyebrow(if (isImage) "IMAGE" else if (isHtml) "HTML DOCUMENT" else "FILE", color = inks.pine)
+                Eyebrow(if (isImage) "IMAGE" else if (isHtml) "HTML DOCUMENT" else "FILE", color = inks.accent)
                 Text(name, style = MaterialTheme.typography.titleLarge, maxLines = 2, overflow = TextOverflow.Ellipsis)
             }
             GlyphButton(Glyph.Export, if (dirty) "Export last saved version" else "Export file", enabled = action == null) {
@@ -289,7 +289,7 @@ private fun FilePage(
                 original != null -> "UTF-8 text"
                 else -> ""
             }
-            Text(subtitle, Modifier.weight(1f), color = if (dirty) inks.rust else inks.quiet,
+            Text(subtitle, Modifier.weight(1f), color = if (dirty) inks.danger else inks.quiet,
                 style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
             if (isHtml && original != null && editable) {
                 TextButton(onClick = { preview = !preview }, enabled = action == null) {
@@ -329,7 +329,7 @@ private fun FilePage(
                     },
                     enabled = action == null,
                     modifier = Modifier.fillMaxSize(), textStyle = CodeType.copy(color = inks.ink),
-                    cursorBrush = SolidColor(inks.pine),
+                    cursorBrush = SolidColor(inks.accent),
                     keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.None, autoCorrectEnabled = false),
                     decorationBox = { content ->
                         Box(Modifier.fillMaxSize().padding(12.dp)) {
