@@ -21,7 +21,7 @@ For manual startup, leave the last command running in Debian. If you use the And
 
 ## Install and pair
 
-Push this project to a GitHub repo with Actions enabled. The **Tsun CI** workflow builds and tests the daemon and builds/lints a debug APK without using the phone's Android toolchain. In the Actions run, download **Tsun-debug**, unzip it, and sideload `app-debug.apk` (Android 8+). These are debug builds; a later CI build may use a different debug signing key, in which case Android will require uninstalling the old build before installing the new one.
+Push this project to a GitHub repo with Actions enabled. The **Tsun CI** workflow builds and tests the daemon and builds/lints a debug APK without using the phone's Android toolchain. In the Actions run, download **Tsun-release** (recommended) or **Tsun-debug**, unzip it, and sideload the APK (Android 8+). The release APK is R8-optimized and much smoother to use; the debug APK is for diagnosing crashes. Both are signed with the CI runner's debug signing key, so a later CI build may use a different key, in which case Android will require uninstalling the old build before installing the new one.
 
 ### Start from the app (rooted Android)
 

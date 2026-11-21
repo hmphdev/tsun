@@ -28,9 +28,17 @@ jobs:
           ctest --test-dir build --output-on-failure
 
   android:
-    name: Android debug APK
+    name: Android APK (${{ matrix.build }})
     runs-on: ubuntu-24.04
     timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - build: debug
+            tasks: ":app:assembleDebug :app:lintDebug"
+          - build: release
+            tasks: ":app:assembleRelease :app:lintRelease"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -50,9 +58,9 @@ jobs:
           printf 'ANDROID_HOME=%s\n' "$sdk" >> "$GITHUB_ENV"
       - name: Build and lint
         working-directory: android
-        run: gradle --no-daemon :app:assembleDebug :app:lintDebug
+        run: gradle --no-daemon ${{ matrix.tasks }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: Tsun-debug
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          name: Tsun-${{ matrix.build }}
+          path: android/app/build/outputs/apk/${{ matrix.build }}/app-${{ matrix.build }}.apk
           if-no-files-found: error
