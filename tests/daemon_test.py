@@ -1,4 +1,5 @@
 from contextlib import closing
+import base64
 import hashlib
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -557,6 +558,53 @@ class DaemonTest(unittest.TestCase):
         self.assertEqual(items[-1]["additions"], 1)
         self.assertEqual(self.git(self.repo, "for-each-ref", "--format=%(refname)", "refs/tsun/").splitlines()[-1],
                          f"refs/tsun/checkpoints/{thread_id}/2")
+
+    def test_read_file_returns_images_for_both_providers(self):
+        pixel = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==")
+        (self.workspace / "pixel.png").write_bytes(pixel)
+        encoded = base64.b64encode(pixel).decode()
+        self.model.script += [
+            anthropic_stream([{"type": "tool_use", "id": "toolu_png", "name": "read_file",
+                               "input": {"path": "pixel.png"}}], "tool_use"),
+            anthropic_stream([{"type": "text", "text": "A one-pixel image."}], "end_turn"),
+            openai_stream(calls=[("call_png", "read_file", {"path": "pixel.png"})], finish="tool_calls"),
+            openai_stream(content="Still a one-pixel image."),
+            openai_stream(calls=[("call_bin", "read_file", {"path": "sample.bin"})], finish="tool_calls"),
+            openai_stream(content="That one is not text."),
+        ]
+        thread = self.post("/v1/threads", {"workspace": "demo", "prompt": "What is in pixel.png?"}, 201)
+        thread_id = thread["id"]
+        thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle")
+        tool = next(entry for entry in items if entry["kind"] == "tool")
+        self.assertEqual((tool["name"], tool["status"], tool["image"]), ("read_file", "done", "image/png"))
+        self.assertEqual(tool["bytes"], len(pixel))
+
+        # Anthropic: the tool_result carries the image block next to a text summary.
+        result = self.model.requests[1]["body"]["messages"][2]["content"][0]
+        self.assertEqual((result["type"], result["tool_use_id"]), ("tool_result", "toolu_png"))
+        text, image = result["content"]
+        self.assertEqual(image, {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                                              "data": encoded}})
+        self.assertIn("image/png", text["text"])
+
+        # OpenAI: tool messages are text-only, so the image follows as a user turn.
+        self.post(f"/v1/threads/{thread_id}/messages", {"text": "Describe it again", "provider": "local"}, 202)
+        thread, items = self.thread_until(thread_id, lambda t, i: t["state"] == "idle" and t["runs"] == 2)
+        messages = self.model.requests[2]["body"]["messages"]
+        self.assertEqual(messages[-1], {"role": "user", "content": "Describe it again"})
+        follow_up = self.model.requests[3]["body"]["messages"]
+        self.assertEqual(follow_up[-2]["role"], "tool")
+        self.assertEqual(follow_up[-1]["role"], "user")
+        self.assertEqual(follow_up[-1]["content"][1], {"type": "image_url", "image_url": {
+            "url": "data:image/png;base64," + encoded}})
+
+        # Other binaries stay text-only failures.
+        self.post(f"/v1/threads/{thread_id}/messages", {"text": "Now the binary", "provider": "local"}, 202)
+        thread, items = self.thread_until(thread_id, lambda t, i: t["state"] == "idle" and t["runs"] == 3)
+        binary = [entry for entry in items if entry["kind"] == "tool"][-1]
+        self.assertEqual((binary["status"], "image" in binary), ("error", False))
+        self.assertIn("not UTF-8 text", binary["output"])
 
     def test_effort_command_overrides_reasoning_effort(self):
         self.model.script += [

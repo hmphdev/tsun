@@ -13,6 +13,7 @@ struct ToolOutcome {
     bool error = false;
     Json display = Json::object(); // extra fields for the app (exit code, diff, preview)
     std::int64_t input_tokens = 0, output_tokens = 0; // model usage for delegated work
+    std::optional<ToolImage> image; // set when the result is a raster image
 };
 
 struct ToolContext {

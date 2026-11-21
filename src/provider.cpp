@@ -213,6 +213,17 @@ std::string result_text(const ToolResult& result) {
     return result.content.empty() ? "(no output)" : result.content;
 }
 
+// Anthropic accepts image blocks inside a tool_result; OpenAI's tool role is
+// text only, so that adapter appends the image as a follow-up user message.
+Json tool_result_content(const ToolResult& result) {
+    if (!result.image) return result_text(result);
+    return Json::array({
+        {{"type", "text"}, {"text", result_text(result)}},
+        {{"type", "image"},
+            {"source", {{"type", "base64"}, {"media_type", result.image->media_type}, {"data", result.image->data}}}},
+    });
+}
+
 // ---- Anthropic Messages API --------------------------------------------------
 
 class AnthropicStream {
@@ -401,7 +412,8 @@ private:
             case Turn::Role::Tools: {
                 Json blocks = Json::array();
                 for (const auto& r : turn.results) {
-                    Json block = {{"type", "tool_result"}, {"tool_use_id", portable_id(r.call_id)}, {"content", result_text(r)}};
+                    Json block = {{"type", "tool_result"}, {"tool_use_id", portable_id(r.call_id)},
+                        {"content", tool_result_content(r)}};
                     if (r.error) block["is_error"] = true;
                     blocks.push_back(std::move(block));
                 }
@@ -615,6 +627,15 @@ private:
                 for (const auto& r : turn.results) {
                     result.push_back({{"role", "tool"}, {"tool_call_id", portable_id(r.call_id)},
                         {"content", r.error ? "Error: " + result_text(r) : result_text(r)}});
+                }
+                // Tool messages cannot carry images here, so each one follows up as a user turn.
+                for (const auto& r : turn.results) {
+                    if (!r.image) continue;
+                    result.push_back({{"role", "user"}, {"content", Json::array({
+                        {{"type", "text"}, {"text", "Image returned by " + r.name + ": " + result_text(r)}},
+                        {{"type", "image_url"}, {"image_url",
+                            {{"url", "data:" + r.image->media_type + ";base64," + r.image->data}}}},
+                    })}});
                 }
                 break;
             case Turn::Role::Assistant: {

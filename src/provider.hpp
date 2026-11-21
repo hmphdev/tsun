@@ -5,6 +5,7 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <optional>
 
 namespace tsun {
 
@@ -25,11 +26,19 @@ struct ToolCall {
     std::string invalid_input; // set when the model sent unparseable JSON
 };
 
+// A raster image a tool returned (base64, provider-neutral) so adapters can
+// attach it to the wire format instead of describing it in text.
+struct ToolImage {
+    std::string media_type; // image/png, image/jpeg, image/gif, image/webp
+    std::string data;       // base64, no line breaks
+};
+
 struct ToolResult {
     std::string call_id;
     std::string name;
     std::string content;
     bool error = false;
+    std::optional<ToolImage> image;
 };
 
 struct Turn {

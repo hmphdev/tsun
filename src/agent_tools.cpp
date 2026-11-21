@@ -9,8 +9,11 @@
 #include <array>
 #include <cerrno>
 #include <condition_variable>
+#include <cstdint>
 #include <cstring>
 #include <functional>
+#include <initializer_list>
+#include <optional>
 #include <thread>
 
 extern char** environ;
@@ -36,7 +39,8 @@ std::vector<ToolSpec> build_tools() {
                 {"timeout_seconds", {{"type", "integer"}, {"description", "Time limit, 1-600 seconds (default 120)"}}}},
                 {"command"})},
         {"read_file",
-            "Read a UTF-8 text file. Lines are numbered from 1. Use offset and limit for large files.",
+            "Read a file. UTF-8 text comes back with lines numbered from 1; use offset and limit for large files. "
+            "PNG, JPEG, GIF, and WebP images up to 2 MiB come back as an image you can see.",
             schema({{"path", {{"type", "string"}, {"description", "Path relative to the workspace root, or absolute inside it"}}},
                 {"offset", {{"type", "integer"}, {"description", "First line to read (1-based)"}}},
                 {"limit", {{"type", "integer"}, {"description", "Maximum number of lines (default 2000)"}}}},
@@ -187,6 +191,49 @@ bool is_text(const std::string& text) {
     }
 }
 
+bool starts_with(const std::string& bytes, std::initializer_list<unsigned char> signature) {
+    if (bytes.size() < signature.size()) return false;
+    std::size_t at = 0;
+    for (const auto byte : signature) {
+        if (static_cast<unsigned char>(bytes[at++]) != byte) return false;
+    }
+    return true;
+}
+
+// Formats every supported model accepts. The extension is ignored: the bytes decide.
+std::optional<std::string> image_type(const std::string& bytes) {
+    if (starts_with(bytes, {0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a})) return "image/png";
+    if (starts_with(bytes, {0xff, 0xd8, 0xff})) return "image/jpeg";
+    if (starts_with(bytes, {'G', 'I', 'F', '8', '7', 'a'}) || starts_with(bytes, {'G', 'I', 'F', '8', '9', 'a'})) return "image/gif";
+    if (starts_with(bytes, {'R', 'I', 'F', 'F'}) && bytes.size() > 11 && bytes.compare(8, 4, "WEBP") == 0) return "image/webp";
+    return std::nullopt;
+}
+
+std::string base64(const std::string& bytes) {
+    static constexpr char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const auto* data = reinterpret_cast<const unsigned char*>(bytes.data());
+    std::string out;
+    out.reserve((bytes.size() + 2) / 3 * 4);
+    std::size_t at = 0;
+    for (; at + 3 <= bytes.size(); at += 3) {
+        const std::uint32_t group = (std::uint32_t{data[at]} << 16) | (std::uint32_t{data[at + 1]} << 8) | data[at + 2];
+        out += alphabet[(group >> 18) & 63];
+        out += alphabet[(group >> 12) & 63];
+        out += alphabet[(group >> 6) & 63];
+        out += alphabet[group & 63];
+    }
+    const auto left = bytes.size() - at;
+    if (left > 0) {
+        const std::uint32_t group = (std::uint32_t{data[at]} << 16) | (left == 2 ? std::uint32_t{data[at + 1]} << 8 : 0);
+        out += alphabet[(group >> 18) & 63];
+        out += alphabet[(group >> 12) & 63];
+        out += left == 2 ? alphabet[(group >> 6) & 63] : '=';
+        out += '=';
+    }
+    return out;
+}
+
 void write_atomic(const Fd& parent, const std::string& name, std::string_view text, mode_t mode, const std::string& display) {
     static std::atomic<unsigned long> counter{0};
     const auto temp = ".tsun-agent-" + std::to_string(::getpid()) + "-" + std::to_string(++counter);
@@ -243,7 +290,17 @@ ToolOutcome read_file(const ToolContext& context, const Json& input) {
         throw Error(403, "Mounted or hard-linked files are not supported: " + display);
     }
     const auto text = read_all(file->fd, display);
-    if (!is_text(text)) throw Error(415, display + " is not UTF-8 text");
+    if (!is_text(text)) {
+        const auto type = image_type(text);
+        if (!type) throw Error(415, display + " is not UTF-8 text");
+        // Offset and limit do not apply: the whole image goes to the model.
+        ToolOutcome outcome;
+        outcome.content = display + " is a " + *type + " image (" + std::to_string(text.size())
+            + " bytes). It is attached to this result.";
+        outcome.display = {{"image", *type}, {"bytes", text.size()}};
+        outcome.image = ToolImage{*type, base64(text)};
+        return outcome;
+    }
     const auto offset = std::max<std::int64_t>(1, field(input, "offset") ? input["offset"].get<std::int64_t>() : 1);
     const auto limit = std::clamp<std::int64_t>(field(input, "limit") ? input["limit"].get<std::int64_t>() : 2000, 1, 5000);
     std::string out;
@@ -617,6 +674,7 @@ ToolOutcome run_delegate(const ToolContext& context, const ToolCall& call, const
                 auto output = run_tool({context.root, context.root_path, cancel}, child_call);
                 result.content = clip(std::move(output.content), 12 * 1024);
                 result.error = output.error;
+                result.image = std::move(output.image);
             }
             results.results.push_back(std::move(result));
         }
