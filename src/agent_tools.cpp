@@ -64,7 +64,7 @@ std::vector<ToolSpec> build_tools() {
             schema({{"path", {{"type", "string"}, {"description", "Directory relative to the workspace root (default: the root)"}}}},
                 {})},
         {"search",
-            "Search file contents with an extended regular expression (grep -E). Returns matching lines with file "
+            "Search file contents with a regular expression (ripgrep). Returns matching lines with file "
             "names and line numbers. Skips binary files and .git.",
             schema({{"pattern", {{"type", "string"}, {"description", "Extended regular expression"}}},
                 {"path", {{"type", "string"}, {"description", "Directory or file to search (default: the root)"}}},
@@ -473,9 +473,9 @@ ToolOutcome search(const ToolContext& context, const Json& input) {
     const auto pattern = text_field(input, "pattern");
     if (pattern.empty() || pattern.size() > 2000) throw Error(400, "pattern must be 1–2000 bytes");
     const auto parts = resolve(context.root_path, text_field(input, "path"));
-    std::vector<std::string> argv{"/usr/bin/grep", "-rnIE", "--color=never", "--exclude-dir=.git", "-m", "50"};
+    std::vector<std::string> argv{"/usr/bin/rg", "-n", "--color", "never", "--no-heading", "-m", "50"};
     const auto glob = text_field(input, "glob");
-    if (!glob.empty()) argv.push_back("--include=" + glob);
+    if (!glob.empty()) argv.push_back("--glob=" + glob);
     argv.insert(argv.end(), {"-e", pattern, "--", join(parts)});
     ProcessOptions options;
     options.timeout = std::chrono::seconds(30);
@@ -484,7 +484,7 @@ ToolOutcome search(const ToolContext& context, const Json& input) {
     options.tail_limit = 0;
     const auto result = run_process(context.root.directory, argv, options);
     if (result.exit_code == 1) return {"No matches.", false, {{"matches", 0}}};
-    if (result.exit_code != 0) return {"grep failed: " + result.output, true, {}};
+    if (result.exit_code != 0) return {"search failed: " + result.output, true, {}};
     auto out = result.output;
     if (result.truncated) out += "\n… (results truncated; narrow the pattern or path)\n";
     return {out, false, {{"matches", count_lines(result.output)}}};
