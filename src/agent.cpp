@@ -1,14 +1,18 @@
 #include "agent.hpp"
 #include "process.hpp"
 
+#include <dirent.h>
 #include <openssl/rand.h>
 #include <sys/stat.h>
 
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <fstream>
+#include <iterator>
 #include <set>
 #include <sstream>
+#include <vector>
 
 namespace tsun {
 namespace {
@@ -78,11 +82,29 @@ std::string first_line(const std::string& text) {
 }
 
 struct NumStat {
-    int additions = 0, deletions = 0;
+    int additions = 0, deletions = 0;       // lines the agent edited
+    int copied_files = 0, copied_lines = 0; // whole files that appeared without the agent writing them
+    std::set<std::string> copied;           // their paths, before the file list is truncated
     Json files = Json::array();
 };
 
-NumStat parse_numstat(const std::string& output) {
+// Paths of files that do not exist in the diff's parent, i.e. whole files.
+// `range` is the rest of the git diff arguments ("-M parent commit" or "--cached -M base").
+std::set<std::string> whole_paths(const FileRoot& root, const std::vector<std::string>& range,
+                                  const std::vector<std::string>& env = {}) {
+    std::vector<std::string> args{"diff", "--name-only", "--diff-filter=A", "--no-color", "--no-ext-diff", "-M"};
+    args.insert(args.end(), range.begin(), range.end());
+    std::set<std::string> paths;
+    std::istringstream lines(run_git(root.directory, args, nullptr, env).output);
+    for (std::string line; std::getline(lines, line);) if (!line.empty()) paths.insert(line);
+    return paths;
+}
+
+// A whole file's diff is the entire file, so it only counts as the agent's work
+// when an edit tool wrote it. Files that merely appeared (copied in with a
+// command, unpacked, or generated) are reported as copied and kept out of the
+// line totals, so a vendored directory does not look like thousands of edits.
+NumStat parse_numstat(const std::string& output, const std::set<std::string>& copied = {}) {
     NumStat stat;
     std::istringstream lines(output);
     std::string line;
@@ -93,13 +115,29 @@ NumStat parse_numstat(const std::string& output) {
         const auto added = line.substr(0, tab1), removed = line.substr(tab1 + 1, tab2 - tab1 - 1);
         const int a = added == "-" ? 0 : std::atoi(added.c_str());
         const int d = removed == "-" ? 0 : std::atoi(removed.c_str());
-        stat.additions += a;
-        stat.deletions += d;
-        if (stat.files.size() < 60) {
-            stat.files.push_back({{"path", line.substr(tab2 + 1)}, {"additions", a}, {"deletions", d}, {"binary", added == "-"}});
+        const auto path = line.substr(tab2 + 1);
+        Json file = {{"path", path}, {"additions", a}, {"deletions", d}, {"binary", added == "-"}};
+        if (copied.count(path) > 0) {
+            file["copied"] = true;
+            ++stat.copied_files;
+            stat.copied_lines += a;
+            stat.copied.insert(path);
+        } else {
+            stat.additions += a;
+            stat.deletions += d;
         }
+        if (stat.files.size() < 60) stat.files.push_back(std::move(file));
     }
     return stat;
+}
+
+// The worktree-relative path a file tool wrote, for matching against git paths.
+std::string written_path(const std::string& root_path, const Json& input) {
+    if (!input.is_object() || !input.contains("path") || !input["path"].is_string()) return {};
+    auto path = input["path"].get<std::string>();
+    if (path.rfind(root_path + "/", 0) == 0) path = path.substr(root_path.size() + 1);
+    while (path.rfind("./", 0) == 0) path.erase(0, 2);
+    return path;
 }
 
 FileRoot duplicate_root(const FileRoot& root) {
@@ -152,6 +190,57 @@ std::string workspace_guidance(const FileRoot& root) {
         "<workspace_guidance>\n" + instructions + "\n</workspace_guidance>\n";
 }
 
+Json turn_to_json(const Turn& turn) {
+    Json calls = Json::array();
+    for (const auto& call : turn.calls) {
+        calls.push_back({{{"id", call.id}, {"name", call.name}, {"input", call.input}, {"invalid", call.invalid_input}}});
+    }
+    Json results = Json::array();
+    for (const auto& result : turn.results) {
+        Json entry = {{"call", result.call_id}, {"name", result.name}, {"content", result.content}, {"error", result.error}};
+        if (result.image) entry["image"] = {{"mediaType", result.image->media_type}, {"data", result.image->data}};
+        results.push_back(std::move(entry));
+    }
+    const auto role = turn.role == Turn::Role::Assistant ? "assistant" : turn.role == Turn::Role::Tools ? "tools" : "user";
+    Json entry = {{"role", role}, {"text", turn.text}, {"calls", std::move(calls)}, {"results", std::move(results)}};
+    if (!turn.native_owner.empty()) {
+        entry["nativeOwner"] = turn.native_owner;
+        entry["native"] = turn.native;
+    }
+    return entry;
+}
+
+Turn turn_from_json(const Json& entry) {
+    Turn turn;
+    const auto role = entry.value("role", std::string("user"));
+    turn.role = role == "assistant" ? Turn::Role::Assistant : role == "tools" ? Turn::Role::Tools : Turn::Role::User;
+    turn.text = entry.value("text", std::string{});
+    for (const auto& call : entry.value("calls", Json::array())) {
+        turn.calls.push_back({call.value("id", std::string{}), call.value("name", std::string{}),
+                              call.value("input", Json::object()), call.value("invalid", std::string{})});
+    }
+    for (const auto& result : entry.value("results", Json::array())) {
+        ToolResult restored{result.value("call", std::string{}), result.value("name", std::string{}),
+                            result.value("content", std::string{}), result.value("error", false)};
+        if (const auto image = result.find("image"); image != result.end() && image->is_object()) {
+            restored.image = ToolImage{image->value("mediaType", std::string("image/png")), image->value("data", std::string{})};
+        }
+        turn.results.push_back(std::move(restored));
+    }
+    turn.native_owner = entry.value("nativeOwner", std::string{});
+    if (const auto native = entry.find("native"); native != entry.end()) turn.native = *native;
+    return turn;
+}
+
+// The FDs only live as long as the process, so threads remember how to reopen their roots.
+std::string root_path_of(const std::shared_ptr<const FileRoot>& root) {
+    if (!root) return {};
+    const auto link = "/proc/self/fd/" + std::to_string(root->directory.get());
+    std::array<char, 4096> buffer{};
+    const auto size = ::readlink(link.c_str(), buffer.data(), buffer.size() - 1);
+    return size > 0 ? std::string(buffer.data(), static_cast<std::size_t>(size)) : std::string{};
+}
+
 } // namespace
 
 struct Agents::PeerRequest {
@@ -182,17 +271,27 @@ struct Agents::Thread {
     std::thread worker;
     std::shared_ptr<PeerRequest> peer;
     std::string base_commit, last_checkpoint;
+    std::set<std::string> run_writes; // paths the file tools wrote this run
+    std::set<std::string> copied;     // paths that appeared whole without an edit-tool write
     int additions = 0, deletions = 0, files_changed = 0;
+    int copied_files = 0, copied_lines = 0;
     std::int64_t input_tokens = 0, output_tokens = 0;
     std::int64_t created_at = now_ms(), updated_at = now_ms();
+    // Last revision written to STATE_DIR/threads, so the saver only rewrites changes.
+    std::uint64_t saved_rev = 0;
+    std::string saved_state;
+    bool saved = false; // a thread that predates this revision of the file still gets written
 
     bool active() const { return state != "idle"; }
 };
 
 Agents::Agents(std::string state_path, ProviderSet providers)
-    : state_path_(std::move(state_path)), providers_(std::move(providers)) {
+    : state_path_(std::move(state_path)), threads_path_(state_path_ + "/threads"), providers_(std::move(providers)) {
     const auto scratch = state_path_ + "/tmp";
     if (::mkdir(scratch.c_str(), 0700) < 0 && errno != EEXIST) throw std::runtime_error("Could not create STATE_DIR/tmp");
+    // Threads live in memory, so a restart would otherwise lose every conversation.
+    load_threads();
+    saver_ = std::thread([this] { save_loop(); });
 }
 
 Agents::~Agents() {
@@ -205,6 +304,13 @@ Agents::~Agents() {
     }
     changed_.notify_all();
     for (auto& thread : threads) if (thread->worker.joinable()) thread->worker.join();
+    stop_saver_ = true;
+    if (saver_.joinable()) saver_.join();
+    try {
+        save_changed(true);
+    } catch (const std::exception&) {
+        // Shutdown must not fail because the state directory became unwritable.
+    }
 }
 
 Json& Agents::add_item(Thread& thread, Json item) {
@@ -236,6 +342,181 @@ std::shared_ptr<Agents::Thread> Agents::find(std::string_view id) const {
     throw Error(404, "Thread not found");
 }
 
+Json Agents::document(const Thread& thread) const {
+    Json history = Json::array();
+    for (const auto& turn : thread.history) history.push_back(turn_to_json(turn));
+    Json items = Json::array();
+    for (const auto& entry : thread.items) items.push_back(entry);
+    return {
+        {"version", 1}, {"id", thread.id}, {"workspace", thread.workspace},
+        {"workspaceLabel", thread.workspace_label}, {"title", thread.title},
+        {"branch", thread.branch}, {"isolated", thread.isolated},
+        {"checkout", root_path_of(thread.workspace_root)}, {"worktree", thread.worktree_path},
+        {"root", thread.root_path}, {"mode", thread.mode}, {"provider", thread.provider_id},
+        {"effort", thread.effort}, {"runs", thread.runs},
+        {"baseCommit", thread.base_commit}, {"lastCheckpoint", thread.last_checkpoint},
+        {"additions", thread.additions}, {"deletions", thread.deletions},
+        {"filesChanged", thread.files_changed},
+        {"copiedFiles", thread.copied_files}, {"copiedLines", thread.copied_lines},
+        {"inputTokens", thread.input_tokens}, {"outputTokens", thread.output_tokens},
+        {"createdAt", thread.created_at}, {"updatedAt", thread.updated_at},
+        {"rev", thread.rev}, {"nextItem", thread.next_item},
+        {"history", std::move(history)}, {"items", std::move(items)},
+    };
+}
+
+void Agents::save_thread(const Json& document) const {
+    const auto id = document.value("id", std::string{});
+    if (id.empty()) return;
+    const auto path = threads_path_ + "/" + id + ".json";
+    const auto temporary = path + ".tmp";
+    try {
+        const auto text = document.dump();
+        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+        if (!out) return;
+        out.write(text.data(), static_cast<std::streamsize>(text.size()));
+        out.close();
+        if (out.fail()) {
+            std::remove(temporary.c_str());
+            return;
+        }
+        ::chmod(temporary.c_str(), 0600);
+        // Rename last: a crash either leaves the previous transcript or the new one, never half of each.
+        if (std::rename(temporary.c_str(), path.c_str()) != 0) std::remove(temporary.c_str());
+    } catch (const std::exception&) {
+        // Persistence is a convenience: a full disk must not break a turn.
+    }
+}
+
+void Agents::save_changed(bool everything) {
+    std::vector<std::pair<std::shared_ptr<Thread>, Json>> pending;
+    {
+        const std::lock_guard lock(mutex_);
+        for (const auto& thread : threads_) {
+            if (!everything && thread->saved && thread->saved_rev == thread->rev && thread->saved_state == thread->state) continue;
+            pending.emplace_back(thread, document(*thread));
+        }
+    }
+    for (auto& [thread, snapshot] : pending) {
+        save_thread(snapshot);
+        const std::lock_guard lock(mutex_);
+        thread->saved = true;
+        thread->saved_rev = snapshot.value("rev", std::uint64_t{0});
+        thread->saved_state = thread->state;
+    }
+}
+
+void Agents::save_loop() {
+    // Streaming changes rev on every delta, so a ticking saver beats a hook in each mutator.
+    for (int tick = 0; !stop_saver_; ++tick) {
+        if (tick % 5 == 0) {
+            try {
+                save_changed(false);
+            } catch (const std::exception&) {
+                // Keep ticking; the next pass retries.
+            }
+        }
+        std::this_thread::sleep_for(200ms);
+    }
+}
+
+void Agents::load_threads() {
+    if (::mkdir(threads_path_.c_str(), 0700) < 0 && errno != EEXIST) return;
+    DIR* directory = ::opendir(threads_path_.c_str());
+    if (!directory) return;
+    std::vector<std::shared_ptr<Thread>> loaded;
+    while (const auto* entry = ::readdir(directory)) {
+        const std::string name = entry->d_name;
+        if (name.size() < 6 || name.compare(name.size() - 5, 5, ".json") != 0) continue;
+        try {
+            if (auto thread = restore(threads_path_ + "/" + name)) loaded.push_back(std::move(thread));
+        } catch (const std::exception&) {
+            // One damaged file must not stop the others from loading.
+        }
+    }
+    ::closedir(directory);
+    std::sort(loaded.begin(), loaded.end(), [](const auto& a, const auto& b) { return a->updated_at > b->updated_at; });
+    if (loaded.size() > max_threads) loaded.resize(max_threads);
+    for (auto& thread : loaded) threads_.push_back(std::move(thread));
+}
+
+std::shared_ptr<Agents::Thread> Agents::restore(const std::string& path) const {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return {};
+    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (text.empty() || text.size() > (64u << 20)) return {};
+    const auto stored = Json::parse(text, nullptr, false);
+    if (!stored.is_object()) return {};
+    const auto id = stored.value("id", std::string{});
+    if (id.empty()) return {};
+    auto thread = std::make_shared<Thread>();
+    thread->id = id;
+    thread->workspace = stored.value("workspace", std::string{});
+    thread->workspace_label = stored.value("workspaceLabel", std::string{});
+    thread->title = stored.value("title", std::string{});
+    thread->branch = stored.value("branch", std::string{});
+    thread->worktree_path = stored.value("worktree", std::string{});
+    thread->root_path = stored.value("root", std::string{});
+    thread->isolated = stored.value("isolated", false);
+    thread->mode = checked_mode(stored.value("mode", std::string("edits")));
+    thread->provider_id = stored.value("provider", providers_.default_id);
+    if (!providers_.find(thread->provider_id)) thread->provider_id = providers_.default_id;
+    thread->effort = stored.value("effort", std::string{});
+    thread->runs = stored.value("runs", 0);
+    thread->base_commit = stored.value("baseCommit", std::string{});
+    thread->last_checkpoint = stored.value("lastCheckpoint", std::string{});
+    thread->additions = stored.value("additions", 0);
+    thread->deletions = stored.value("deletions", 0);
+    thread->files_changed = stored.value("filesChanged", 0);
+    thread->copied_files = stored.value("copiedFiles", 0);
+    thread->copied_lines = stored.value("copiedLines", 0);
+    thread->input_tokens = stored.value("inputTokens", std::int64_t{0});
+    thread->output_tokens = stored.value("outputTokens", std::int64_t{0});
+    thread->created_at = stored.value("createdAt", now_ms());
+    thread->updated_at = stored.value("updatedAt", thread->created_at);
+    for (const auto& entry : stored.value("history", Json::array())) {
+        if (entry.is_object()) thread->history.push_back(turn_from_json(entry));
+    }
+    auto items = stored.value("items", Json::array());
+    for (auto& entry : items) {
+        if (!entry.is_object() || !entry.contains("id") || !entry["id"].is_string()) continue;
+        if (entry.value("streaming", false)) {
+            // The daemon died mid-stream; show what arrived instead of a spinner that never stops.
+            entry["streaming"] = false;
+            if (entry.value("status", std::string{}) == "streaming") entry["status"] = "error";
+        }
+        thread->index[entry["id"].get<std::string>()] = thread->items.size();
+        thread->items.push_back(std::move(entry));
+    }
+    thread->rev = stored.value("rev", std::uint64_t{0});
+    thread->next_item = stored.value("nextItem", std::uint64_t{0});
+
+    const auto checkout = stored.value("checkout", std::string{});
+    if (!checkout.empty()) {
+        try {
+            thread->workspace_root = std::make_shared<const FileRoot>(open_file_root(checkout.c_str()));
+        } catch (const std::exception&) {
+            // The checkout may have moved; files tools report that when the thread next runs.
+        }
+    }
+    if (thread->isolated) {
+        try {
+            thread->root = std::make_shared<const FileRoot>(open_file_root(thread->worktree_path.c_str()));
+            thread->root_path = thread->worktree_path;
+        } catch (const std::exception&) {
+            // A removed worktree is recreated on the next run by prepare().
+        }
+    } else if (thread->workspace_root) {
+        thread->root = thread->workspace_root;
+        if (thread->root_path.empty()) thread->root_path = checkout;
+    }
+    thread->state = "idle";
+    thread->saved = true;
+    thread->saved_rev = thread->rev;
+    thread->saved_state = thread->state;
+    return thread;
+}
+
 Json Agents::summary(const Thread& thread) const {
     const auto* provider = providers_.find(thread.provider_id);
     return {
@@ -247,6 +528,7 @@ Json Agents::summary(const Thread& thread) const {
         {"filesReady", bool(thread.root)}, {"runs", thread.runs},
         {"pendingCall", thread.pending_call.empty() ? Json(nullptr) : Json(thread.pending_call)},
         {"additions", thread.additions}, {"deletions", thread.deletions}, {"filesChanged", thread.files_changed},
+        {"copiedFiles", thread.copied_files}, {"copiedLines", thread.copied_lines},
         {"inputTokens", thread.input_tokens}, {"outputTokens", thread.output_tokens},
         {"error", thread.error.empty() ? Json(nullptr) : Json(thread.error)},
         {"createdAt", thread.created_at}, {"updatedAt", thread.updated_at},
@@ -279,6 +561,7 @@ Json Agents::create(const Workspace& workspace, const Json& body) {
         const auto oldest = std::find_if(threads_.rbegin(), threads_.rend(), [](const auto& t) { return !t->active(); });
         if (oldest == threads_.rend()) throw Error(409, "Too many threads are active");
         if ((*oldest)->worker.joinable()) (*oldest)->worker.join();
+        ::unlink((threads_path_ + "/" + (*oldest)->id + ".json").c_str());
         threads_.erase(std::prev(oldest.base()));
     }
 
@@ -305,7 +588,12 @@ Json Agents::create(const Workspace& workspace, const Json& body) {
     }
     threads_.push_front(thread);
     start_run(thread, prompt);
-    return summary(*thread);
+    const auto created = summary(*thread);
+    save_thread(document(*thread));
+    thread->saved = true;
+    thread->saved_rev = thread->rev;
+    thread->saved_state = thread->state;
+    return created;
 }
 
 void Agents::start_run(const std::shared_ptr<Thread>& thread, std::string prompt, std::shared_ptr<PeerRequest> peer) {
@@ -314,6 +602,7 @@ void Agents::start_run(const std::shared_ptr<Thread>& thread, std::string prompt
     ++thread->runs;
     thread->cancel = false;
     thread->error.clear();
+    thread->run_writes.clear();
     thread->peer = std::move(peer);
     thread->state = thread->root ? "running" : "preparing";
     if (thread->peer) {
@@ -489,6 +778,7 @@ std::shared_ptr<const FileRoot> Agents::files(const Workspace& workspace, std::s
 Json Agents::diff(std::string_view id) const {
     std::shared_ptr<const FileRoot> root;
     std::string base, thread_id;
+    std::set<std::string> known_copied;
     {
         const std::lock_guard lock(mutex_);
         const auto thread = find(id);
@@ -497,6 +787,7 @@ Json Agents::diff(std::string_view id) const {
         root = thread->root;
         base = thread->base_commit;
         thread_id = thread->id;
+        known_copied = thread->copied;
     }
     // Stage the current worktree into a throwaway index, so the diff includes
     // new files and edits made after the last run, without touching the real index.
@@ -509,9 +800,15 @@ Json Agents::diff(std::string_view id) const {
         throw Error(500, "Could not stage the worktree for review");
     }
     auto patch = run_git(root->directory, {"diff", "--cached", "--no-color", "--no-ext-diff", "-M", base}, nullptr, env);
-    const auto stat = parse_numstat(run_git(root->directory, {"diff", "--cached", "--numstat", "-M", base}, nullptr, env).output);
+    std::set<std::string> copied;
+    for (const auto& path : whole_paths(*root, {"--cached", "-M", base}, env)) {
+        if (known_copied.count(path) > 0) copied.insert(path);
+    }
+    const auto stat = parse_numstat(
+        run_git(root->directory, {"diff", "--cached", "--numstat", "-M", base}, nullptr, env).output, copied);
     return {{"diff", patch.output}, {"truncated", patch.truncated}, {"files", stat.files},
-        {"additions", stat.additions}, {"deletions", stat.deletions}};
+        {"additions", stat.additions}, {"deletions", stat.deletions},
+        {"copiedFiles", stat.copied_files}, {"copiedLines", stat.copied_lines}};
 }
 
 // ---- The agent loop ----------------------------------------------------------
@@ -536,22 +833,31 @@ void Agents::work(std::shared_ptr<Thread> thread) {
         const std::lock_guard lock(mutex_);
         add_item(*thread, {{"kind", "notice"}, {"tone", "error"}, {"text", std::string("Checkpoint failed: ") + error.what()}});
     }
-    const std::lock_guard lock(mutex_);
-    if (const auto peer = std::exchange(thread->peer, {})) {
-        // Keep the consultation visible but do not replay the peer as the user in later writable turns.
-        thread->history.resize(peer->history_size);
-        if (thread->cancel) peer->outcome = {"The target session was stopped.", true};
-        else if (!thread->error.empty()) peer->outcome = {"The target session failed: " + thread->error, true};
-        else if (peer->answer.empty()) peer->outcome = {"The target session returned no complete answer.", true};
-        else peer->outcome = {"Reply from session " + thread->id + ":\n" + peer->answer, false};
-        peer->done = true;
+    Json snapshot;
+    {
+        const std::lock_guard lock(mutex_);
+        if (const auto peer = std::exchange(thread->peer, {})) {
+            // Keep the consultation visible but do not replay the peer as the user in later writable turns.
+            thread->history.resize(peer->history_size);
+            if (thread->cancel) peer->outcome = {"The target session was stopped.", true};
+            else if (!thread->error.empty()) peer->outcome = {"The target session failed: " + thread->error, true};
+            else if (peer->answer.empty()) peer->outcome = {"The target session returned no complete answer.", true};
+            else peer->outcome = {"Reply from session " + thread->id + ":\n" + peer->answer, false};
+            peer->done = true;
+        }
+        thread->state = "idle";
+        thread->pending_call.clear();
+        thread->decision.clear();
+        ++thread->rev;
+        thread->updated_at = now_ms();
+        snapshot = document(*thread);
+        thread->saved = true;
+        thread->saved_rev = thread->rev;
+        thread->saved_state = thread->state;
+        changed_.notify_all();
     }
-    thread->state = "idle";
-    thread->pending_call.clear();
-    thread->decision.clear();
-    ++thread->rev;
-    thread->updated_at = now_ms();
-    changed_.notify_all();
+    // Persist the finished run before the worker goes away, so a restart keeps the transcript.
+    save_thread(snapshot);
 }
 
 bool Agents::prepare(Thread& thread) {
@@ -791,6 +1097,9 @@ void Agents::run_steps(Thread& thread) {
                     const auto outcome = delegated ? run_delegate(context, call, *provider, guidance, effort)
                         : call.name == "message_session" ? message_session(thread, call) : run_tool(context, call);
                     lock.lock();
+                    if (!outcome.error && (call.name == "write_file" || call.name == "edit_file")) {
+                        thread.run_writes.insert(written_path(thread.root_path, call.input));
+                    }
                     thread.input_tokens += outcome.input_tokens;
                     thread.output_tokens += outcome.output_tokens;
                     result.content = outcome.content;
@@ -847,17 +1156,39 @@ void Agents::checkpoint(Thread& thread, int run, std::chrono::steady_clock::time
             if (commit.empty()) throw std::runtime_error("could not record the checkpoint");
             run_git(root->directory, {"update-ref", "refs/tsun/checkpoints/" + thread.id + "/" + std::to_string(run), commit});
         }
-        const auto turn = parse_numstat(run_git(root->directory, {"diff", "--numstat", "-M", parent, commit}).output);
-        const auto total = parse_numstat(run_git(root->directory, {"diff", "--numstat", "-M", base, commit}).output);
+        // Whole files that no edit tool wrote this run came from somewhere else:
+        // a copied-in directory or a generated file is not the agent's edits.
+        std::set<std::string> written, known_copied;
+        {
+            const std::lock_guard lock(mutex_);
+            written = thread.run_writes;
+            known_copied = thread.copied;
+        }
+        auto copied = whole_paths(*root, {"-M", parent, commit});
+        for (const auto& path : written) copied.erase(path);
+        const auto turn = parse_numstat(
+            run_git(root->directory, {"diff", "--numstat", "-M", parent, commit}).output, copied);
+        known_copied.insert(turn.copied.begin(), turn.copied.end());
+        std::set<std::string> total_copied;
+        for (const auto& path : whole_paths(*root, {"-M", base, commit})) {
+            if (known_copied.count(path) > 0) total_copied.insert(path);
+        }
+        const auto total = parse_numstat(
+            run_git(root->directory, {"diff", "--numstat", "-M", base, commit}).output, total_copied);
         entry["additions"] = turn.additions;
         entry["deletions"] = turn.deletions;
+        entry["copiedFiles"] = turn.copied_files;
+        entry["copiedLines"] = turn.copied_lines;
         entry["files"] = turn.files;
         entry["checkpoint"] = commit;
         const std::lock_guard lock(mutex_);
         thread.last_checkpoint = commit;
+        thread.copied = std::move(known_copied);
         thread.additions = total.additions;
         thread.deletions = total.deletions;
         thread.files_changed = static_cast<int>(total.files.size());
+        thread.copied_files = total.copied_files;
+        thread.copied_lines = total.copied_lines;
     }
     const std::lock_guard lock(mutex_);
     entry["inputTokens"] = thread.input_tokens;

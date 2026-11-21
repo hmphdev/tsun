@@ -52,12 +52,21 @@ private:
     Json& add_item(Thread& thread, Json item);
     void touch(Thread& thread, Json& item);
     Json* item(Thread& thread, const std::string& id);
+    Json document(const Thread& thread) const;
+    std::shared_ptr<Thread> restore(const std::string& path) const;
+    void save_thread(const Json& document) const;
+    void save_changed(bool everything);
+    void load_threads();
+    void save_loop();
 
     const std::string state_path_;
+    const std::string threads_path_;
     const ProviderSet providers_;
     mutable std::mutex mutex_;
     mutable std::condition_variable changed_;
     std::list<std::shared_ptr<Thread>> threads_;
+    std::thread saver_;
+    std::atomic<bool> stop_saver_{false};
     bool shutting_down_ = false;
 };
 

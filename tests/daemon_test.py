@@ -209,12 +209,16 @@ class DaemonTest(unittest.TestCase):
                 "id": "not-git", "root": str(self.workspace), "commands": [isolated_preset],
             }],
         }), encoding="utf-8")
+        self.process = None
+        self.start_daemon()
+        self.addCleanup(self.shutdown)
+
+    def start_daemon(self):
         self.process = subprocess.Popen(
             [str(DAEMON), str(self.state)], stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, encoding="utf-8",
             env={k: v for k, v in os.environ.items() if k != "BRAVE_SEARCH_API_KEY"},
         )
-        self.addCleanup(self.shutdown)
         with selectors.DefaultSelector() as selector:
             selector.register(self.process.stdout, selectors.EVENT_READ)
             self.assertTrue(selector.select(timeout=5), "daemon did not announce a listening port")
@@ -222,12 +226,18 @@ class DaemonTest(unittest.TestCase):
         self.assertTrue(line.startswith("Tsun listening on https://127.0.0.1:"), line)
         self.port = int(line.rsplit(":", 1)[1])
 
+    def restart(self):
+        self.shutdown()
+        self.start_daemon()
+
     @staticmethod
     def git(directory, *args):
         return subprocess.run(["/usr/bin/git", "-C", str(directory), "-c", "core.hooksPath=/dev/null", *args],
                               check=True, capture_output=True, text=True, timeout=5).stdout.strip()
 
     def shutdown(self):
+        if self.process is None:
+            return
         if self.process.poll() is None:
             self.process.terminate()
         try:
@@ -558,6 +568,52 @@ class DaemonTest(unittest.TestCase):
         self.assertEqual(items[-1]["additions"], 1)
         self.assertEqual(self.git(self.repo, "for-each-ref", "--format=%(refname)", "refs/tsun/").splitlines()[-1],
                          f"refs/tsun/checkpoints/{thread_id}/2")
+
+    def test_copied_files_are_not_counted_as_agent_edits(self):
+        vendor = self.workspace.parent / "vendor"
+        vendor.mkdir()
+        body = "".join(f"int vendored_{index};\n" for index in range(40))
+        (vendor / "lib.c").write_text(body, encoding="utf-8")
+        self.model.script += [
+            anthropic_stream([
+                {"type": "tool_use", "id": "toolu_cp", "name": "bash",
+                 "input": {"command": "cp '" + str(vendor / "lib.c") + "' lib.c"}},
+                {"type": "tool_use", "id": "toolu_own", "name": "write_file",
+                 "input": {"path": "own.txt", "content": "one\ntwo\n"}},
+            ], "tool_use"),
+            anthropic_stream([{"type": "text", "text": "Vendored lib.c and wrote own.txt."}], "end_turn"),
+        ]
+        thread_id = self.post("/v1/threads", {"workspace": "isolated", "prompt": "Vendor it", "mode": "full"}, 201)["id"]
+        thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle")
+        run = items[-1]
+        self.assertEqual(run["kind"], "run")
+        # The copied file is listed, but its 40 lines are not the agent's edits.
+        self.assertEqual((run["additions"], run["deletions"], run["copiedFiles"], run["copiedLines"]), (2, 0, 1, 40))
+        files = {entry["path"]: entry for entry in run["files"]}
+        self.assertEqual((files["own.txt"]["additions"], files["own.txt"].get("copied", False)), (2, False))
+        self.assertEqual((files["lib.c"]["additions"], files["lib.c"]["copied"]), (40, True))
+        self.assertEqual((thread["additions"], thread["filesChanged"]), (2, 2))
+        self.assertEqual((thread["copiedFiles"], thread["copiedLines"]), (1, 40))
+
+        review = self.api("GET", f"/v1/threads/{thread_id}/diff")
+        self.assertEqual((review["additions"], review["deletions"]), (2, 0))
+        self.assertEqual((review["copiedFiles"], review["copiedLines"]), (1, 40))
+        copied = next(entry for entry in review["files"] if entry["path"] == "lib.c")
+        self.assertTrue(copied["copied"])
+        self.assertIn("+int vendored_39;", review["diff"])  # still reviewable in full
+
+        # A later run that edits the copied file reports only its own change.
+        self.model.script += [
+            anthropic_stream([{"type": "tool_use", "id": "toolu_edit", "name": "edit_file",
+                               "input": {"path": "lib.c", "old_text": "int vendored_0;",
+                                         "new_text": "int vendored_0 = 1;"}}], "tool_use"),
+            anthropic_stream([{"type": "text", "text": "Set the first value."}], "end_turn"),
+        ]
+        self.post(f"/v1/threads/{thread_id}/messages", {"text": "Set the first value"}, 202)
+        thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle" and t["runs"] == 2)
+        self.assertEqual((items[-1]["additions"], items[-1]["deletions"], items[-1]["copiedFiles"]), (1, 1, 0))
+        # The branch-wide diff still shows the whole copied file, so it stays marked copied there.
+        self.assertEqual((thread["additions"], thread["copiedFiles"]), (2, 1))
 
     def test_read_file_returns_images_for_both_providers(self):
         pixel = base64.b64decode(
@@ -949,6 +1005,38 @@ class DaemonTest(unittest.TestCase):
         self.post("/v1/threads", {"workspace": "demo", "prompt": "x", "provider": "nope"}, 400)
         self.post("/v1/threads", {"workspace": "demo", "prompt": "   "}, 400)
         self.api("GET", "/v1/threads/" + "0" * 24, status=404)
+
+    def test_threads_and_transcripts_survive_a_daemon_restart(self):
+        self.model.script += [anthropic_stream([{"type": "text", "text": "Remember this note."}], "end_turn")]
+        thread = self.post("/v1/threads", {"workspace": "isolated", "prompt": "Keep this thread"}, 201)
+        thread_id = thread["id"]
+        thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle")
+        self.assertEqual(items[-2]["text"], "Remember this note.")
+        worktree = self.state / "worktrees" / f"isolated-{thread_id}"
+        head = self.git(self.repo, "rev-parse", thread["branch"])
+
+        # Threads live in memory, so the transcript has to reach the state directory before a restart.
+        stored = self.state / "threads" / (thread_id + ".json")
+        self.assertTrue(stored.is_file())
+        self.restart()
+
+        listed = next(t for t in self.api("GET", "/v1/threads")["threads"] if t["id"] == thread_id)
+        self.assertEqual((listed["title"], listed["state"], listed["runs"]), ("Keep this thread", "idle", 1))
+        self.assertEqual((listed["branch"], listed["provider"], listed["mode"]),
+                         (thread["branch"], "claude", "edits"))
+        self.assertEqual((listed["filesReady"], listed["updatedAt"]), (True, thread["updatedAt"]))
+        _, restored = self.thread_until(thread_id, lambda t, _: t["runs"] == 1)
+        self.assertEqual([e["id"] for e in restored], [e["id"] for e in items])
+        self.assertEqual(restored[-1]["kind"], "run")
+
+        # The restored history is replayed, so the model still sees its earlier reply.
+        self.model.script += [anthropic_stream([{"type": "text", "text": "Still here."}], "end_turn")]
+        self.post(f"/v1/threads/{thread_id}/messages", {"text": "What did you just say?"}, 202)
+        thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle" and t["runs"] == 2)
+        replay = self.model.requests[-1]["body"]["messages"]
+        self.assertEqual(replay[1]["content"][0]["text"], "Remember this note.")
+        self.assertEqual(replay[-1], {"role": "user", "content": [{"type": "text", "text": "What did you just say?"}]})
+        self.assertEqual((self.git(self.repo, "rev-parse", thread["branch"]), worktree.is_dir()), (head, True))
 
 
 if __name__ == "__main__":
