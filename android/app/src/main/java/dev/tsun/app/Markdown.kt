@@ -208,15 +208,55 @@ private fun inline(text: String, code: Color, codeBackground: Color, link: Color
                     val label = text.substring(i + 1, close)
                     val url = text.substring(close + 2, end)
                     val style = SpanStyle(color = link, textDecoration = TextDecoration.Underline)
-                    if ((url.startsWith("https://") || url.startsWith("http://")) && url.none { it.isWhitespace() || it.isISOControl() }) {
+                    if (isWebLink(url)) {
                         withLink(LinkAnnotation.Url(url, TextLinkStyles(style = style))) { append(label) }
                     } else withStyle(style) { append(label) }
                     i = end + 1
                 } else { append(c); i++ }
             }
-            else -> { append(c); i++ }
+            // Bare URLs matter as much as [label](url) links: agents paste them as plain text, and
+            // an unannotated URL is neither tappable nor worth retyping on a phone.
+            else -> {
+                val bare = bareUrl(text, i)
+                if (bare != null) {
+                    val style = SpanStyle(color = link, textDecoration = TextDecoration.Underline)
+                    withLink(LinkAnnotation.Url(webUrl(bare), TextLinkStyles(style = style))) { append(bare) }
+                    i += bare.length
+                } else { append(c); i++ }
+            }
         }
     }
+}
+
+private fun isWebLink(url: String) =
+    (url.startsWith("https://") || url.startsWith("http://")) && url.none { it.isWhitespace() || it.isISOControl() }
+
+/** `www.example.com` is common in prose; give it the scheme Android needs to open it. */
+private fun webUrl(url: String) = if (url.startsWith("www.", ignoreCase = true)) "https://$url" else url
+
+/**
+ * The URL starting at [start], or null. Trailing punctuation belongs to the sentence rather than the
+ * link, and a closing bracket only counts when it balances an opening one inside the URL.
+ */
+private fun bareUrl(text: String, start: Int): String? {
+    val first = text[start].lowercaseChar()
+    if (first != 'h' && first != 'w') return null
+    if (start > 0) {
+        val previous = text[start - 1]
+        if (previous.isLetterOrDigit() || previous in "./\\@-_") return null
+    }
+    if (!text.startsWith("http://", start, true) && !text.startsWith("https://", start, true) &&
+        !text.startsWith("www.", start, true)) return null
+    var end = start
+    while (end < text.length && !text[end].isWhitespace() && text[end] !in "<>\"`|") end++
+    while (end > start && text[end - 1] in ".,;:!?*_~'\u2019\u201D") end--
+    while (end > start && text[end - 1] == ')') {
+        val body = text.substring(start, end)
+        if (body.count { it == '(' } < body.count { it == ')' }) end-- else break
+    }
+    val raw = text.substring(start, end)
+    val host = raw.substringAfter("://").substringBefore('/')
+    return if (end > start && host.contains('.')) raw else null
 }
 
 @Composable
