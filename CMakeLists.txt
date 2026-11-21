@@ -22,16 +22,17 @@ FetchContent_Declare(json
 FetchContent_MakeAvailable(httplib json)
 find_package(Threads REQUIRED)
 find_package(OpenSSL 3.0 REQUIRED)
+find_package(LibXml2 REQUIRED)
 
 add_executable(mobile-harness src/main.cpp src/workspaces.cpp src/jobs.cpp src/process.cpp
-    src/provider.cpp src/agent_tools.cpp src/agent.cpp)
+    src/provider.cpp src/agent_tools.cpp src/agent.cpp src/web_tools.cpp)
 target_compile_features(mobile-harness PRIVATE cxx_std_20)
 set_target_properties(mobile-harness PROPERTIES CXX_EXTENSIONS OFF)
 target_compile_options(mobile-harness PRIVATE -Wall -Wextra -Wpedantic)
 target_include_directories(mobile-harness SYSTEM PRIVATE
     "${httplib_SOURCE_DIR}" "${json_SOURCE_DIR}/single_include")
 target_compile_definitions(mobile-harness PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
-target_link_libraries(mobile-harness PRIVATE Threads::Threads OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(mobile-harness PRIVATE Threads::Threads OpenSSL::SSL OpenSSL::Crypto LibXml2::LibXml2)
 
 include(CTest)
 if(BUILD_TESTING)

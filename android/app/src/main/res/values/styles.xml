@@ -1,9 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Tsun</string>
-    <style name="Theme.Tsun" parent="@android:style/Theme.Material.NoActionBar">
-        <item name="android:windowBackground">#1C1410</item>
-        <item name="android:colorAccent">#D58A5E</item>
+    <style name="Theme.Tsun" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">#F7F4ED</item>
+        <item name="android:colorAccent">#29594B</item>
+        <item name="android:windowLightStatusBar">true</item>
         <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:navigationBarColor">@android:color/transparent</item>
     </style>

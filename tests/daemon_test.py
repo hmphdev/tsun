@@ -211,6 +211,7 @@ class DaemonTest(unittest.TestCase):
         self.process = subprocess.Popen(
             [str(DAEMON), str(self.state)], stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, encoding="utf-8",
+            env={k: v for k, v in os.environ.items() if k != "BRAVE_SEARCH_API_KEY"},
         )
         self.addCleanup(self.shutdown)
         with selectors.DefaultSelector() as selector:
@@ -293,6 +294,12 @@ class DaemonTest(unittest.TestCase):
         self.assertNotIn(b"argv", data)
         self.assertNotIn(os.fsencode(self.workspace), data)
         self.api("GET", "/v1/missing", status=404)
+        self.api("GET", "/v1/workspaces?overview=1", auth=False, status=401)
+        self.api("GET", "/v1/workspaces?overview=1&overview=1", status=400)
+        overview = self.api("GET", "/v1/workspaces?overview=1")
+        self.assertEqual(overview.pop("runs"), self.api("GET", "/v1/jobs"))
+        self.assertEqual(overview.pop("threads"), self.api("GET", "/v1/threads"))
+        self.assertEqual(overview, catalog)
 
     def test_tls_and_pairing_code(self):
         with self.assertRaises(ssl.SSLCertVerificationError):
@@ -511,7 +518,8 @@ class DaemonTest(unittest.TestCase):
         self.assertEqual(first["path"], "/v1/messages")
         self.assertEqual(first["headers"]["x-api-key"], "test-key")
         self.assertEqual({t["name"] for t in first["body"]["tools"]},
-                         {"bash", "read_file", "write_file", "edit_file", "list_files", "search"})
+                         {"bash", "read_file", "write_file", "edit_file", "list_files", "search", "delegate_task",
+                          "message_session", "web_fetch", "web_search"})
         self.assertNotIn("eager_input_streaming", first["body"]["tools"][0])  # not the first-party API
         replayed = second["body"]["messages"][1]["content"]
         self.assertEqual(replayed[0], {"type": "thinking", "thinking": "Plan: write a file.", "signature": "sig-abc"})
@@ -593,6 +601,244 @@ class DaemonTest(unittest.TestCase):
         self.assertEqual([r["tool_use_id"] for r in results], ["toolu_a", "toolu_b", "toolu_c", "toolu_d", "toolu_e"])
         self.assertTrue(all(r.get("is_error") for r in results))
         self.assertEqual(history[-1]["content"][-1], {"type": "text", "text": "Never mind"})
+
+    def test_agent_loads_worktree_guidance_once_per_turn(self):
+        guidance = self.repo / "AGENTS.md"
+        guidance.write_text("Use committed guidance.\n", encoding="utf-8")
+        self.git(self.repo, "add", "AGENTS.md")
+        self.git(self.repo, "-c", "user.name=Tsun Test", "-c", "user.email=test@example.invalid",
+                 "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "Add project guidance")
+        guidance.write_text("Uncommitted checkout guidance.\n", encoding="utf-8")
+        self.model.script += [
+            anthropic_stream([
+                {"type": "tool_use", "id": "toolu_edit", "name": "edit_file",
+                 "input": {"path": "AGENTS.md", "old_text": "Use committed guidance.",
+                           "new_text": "Use updated worktree guidance."}},
+                {"type": "tool_use", "id": "toolu_child", "name": "delegate_task",
+                 "input": {"task": "Review the project conventions."}},
+            ], "tool_use"),
+            anthropic_stream([{"type": "text", "text": "Reviewed."}], "end_turn"),
+            anthropic_stream([{"type": "text", "text": "Updated."}], "end_turn"),
+            openai_stream(content="Ready."),
+        ]
+        thread_id = self.post("/v1/threads", {"workspace": "isolated", "prompt": "Update the guidance and delegate a review."}, 201)["id"]
+        thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle")
+        self.assertIsNone(thread["error"])
+        self.assertEqual([(e["name"], e["status"]) for e in items if e["kind"] == "tool"],
+                         [("edit_file", "done"), ("delegate_task", "done")])
+        parent, child, followup = [r["body"]["system"][0]["text"] for r in self.model.requests]
+        for system in (parent, child, followup):
+            self.assertEqual(system.count("Use committed guidance."), 1)
+            self.assertNotIn("Uncommitted checkout guidance.", system)
+            self.assertNotIn("Use updated worktree guidance.", system)
+        self.assertEqual(parent, followup)
+        self.assertIn("read-only subagent", child)
+        self.assertEqual(self.model.requests[1]["body"]["messages"][0]["content"],
+                         [{"type": "text", "text": "Review the project conventions."}])
+
+        self.post(f"/v1/threads/{thread_id}/messages", {"text": "Continue.", "provider": "local"}, 202)
+        thread, _ = self.thread_until(thread_id, lambda t, _: t["state"] == "idle" and t["runs"] == 2)
+        self.assertIsNone(thread["error"])
+        system_message = self.model.requests[-1]["body"]["messages"][0]
+        self.assertEqual(system_message["role"], "system")
+        self.assertIn("Use updated worktree guidance.", system_message["content"])
+        self.assertNotIn("Use committed guidance.", system_message["content"])
+        self.assertNotIn("Uncommitted checkout guidance.", system_message["content"])
+
+    def test_agent_skips_unsupported_workspace_guidance(self):
+        path = self.workspace / "AGENTS.md"
+        outside = self.workspace.parent / "outside"
+        (self.workspace.parent / "AGENTS.md").write_text("Parent directory guidance.\n", encoding="utf-8")
+        cases = {
+            "missing": lambda: None,
+            "blank": lambda: path.write_bytes(b" \t\r\n"),
+            "invalid UTF-8": lambda: path.write_bytes(b"Invalid guidance: \xff"),
+            "oversized": lambda: path.write_bytes(b"x" * (16 * 1024 + 1)),
+            "symlink": lambda: path.symlink_to(outside),
+            "hard link": lambda: os.link(outside, path),
+            "FIFO": lambda: os.mkfifo(path),
+        }
+        for index, (case, create) in enumerate(cases.items(), 1):
+            with self.subTest(case=case):
+                create()
+                try:
+                    self.model.script.append(anthropic_stream([{"type": "text", "text": "OK."}], "end_turn"))
+                    thread_id = self.post("/v1/threads", {"workspace": "demo", "prompt": "Hello."}, 201)["id"]
+                    thread, _ = self.thread_until(thread_id, lambda t, _: t["state"] == "idle")
+                    self.assertIsNone(thread["error"])
+                    self.assertEqual(len(self.model.requests), index)
+                    system = self.model.requests[-1]["body"]["system"][0]["text"]
+                    self.assertNotIn("<workspace_guidance>", system)
+                    self.assertNotIn("Parent directory guidance.", system)
+                finally:
+                    path.unlink(missing_ok=True)
+
+    def test_delegate_uses_fresh_read_only_context_and_returns_findings(self):
+        task = "Inspect notes.txt and report the first line."
+        self.model.script += [
+            openai_stream(calls=[("delegate_1", "delegate_task", {"task": task})], finish="tool_calls"),
+            openai_stream(calls=[("read_1", "read_file", {"path": "notes.txt"}),
+                                 ("write_1", "write_file", {"path": "forbidden.txt", "content": "no"}),
+                                 ("shell_1", "bash", {"command": "touch forbidden.txt"}),
+                                 ("nested_1", "delegate_task", {"task": "Nest a child"}),
+                                 ("escape_1", "read_file", {"path": "../outside"})], finish="tool_calls"),
+            openai_stream(content="notes.txt:1 says committed base."),
+            openai_stream(content="The note starts with 'committed base'."),
+        ]
+        thread_id = self.post("/v1/threads", {"workspace": "isolated", "provider": "local", "mode": "full",
+                           "prompt": "Parent-only context. Ask a subagent about the note."}, 201)["id"]
+        thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle")
+        self.assertIsNone(thread["error"])
+        parent, child, child_followup, parent_followup = [r["body"] for r in self.model.requests]
+        self.assertEqual(parent["model"], child["model"])
+        self.assertEqual({t["function"]["name"] for t in child["tools"]}, {"read_file", "list_files"})
+        self.assertIn("read-only subagent", child["messages"][0]["content"])
+        self.assertEqual(child["messages"][1:], [{"role": "user", "content": task}])
+        child_results = {m["tool_call_id"]: m["content"] for m in child_followup["messages"] if m["role"] == "tool"}
+        self.assertIn("committed base", child_results["read_1"])
+        self.assertNotIn("uncommitted", child_results["read_1"])
+        for call_id in ("write_1", "shell_1", "nested_1"):
+            self.assertIn("only use read_file and list_files", child_results[call_id])
+        self.assertIn("Paths cannot contain ..", child_results["escape_1"])
+        tools = [entry for entry in items if entry["kind"] == "tool"]
+        self.assertEqual([(e["name"], e["status"], e["title"]) for e in tools], [("delegate_task", "done", "Subagent")])
+        self.assertIn("notes.txt:1", tools[0]["output"])
+        self.assertEqual(parent_followup["messages"][-1]["tool_call_id"], "delegate_1")
+        self.assertEqual(parent_followup["messages"][-1]["content"], tools[0]["output"])
+        self.assertEqual((thread["inputTokens"], thread["outputTokens"]), (80, 20))
+        worktree = self.state / "worktrees" / f"isolated-{thread_id}"
+        self.assertFalse((worktree / "forbidden.txt").exists())
+
+    def test_delegate_caps_children_per_message(self):
+        calls = [{"type": "tool_use", "id": f"toolu_{i}", "name": "delegate_task", "input": {"task": f"Inspect part {i}"}}
+                 for i in range(3)]
+        self.model.script += [anthropic_stream(calls, "tool_use")]
+        self.model.script += [anthropic_stream([{"type": "text", "text": "One finding."}], "end_turn")] * 3
+        thread_id = self.post("/v1/threads", {"workspace": "demo", "prompt": "Ask three children", "mode": "ask"}, 201)["id"]
+        _, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle")
+        tools = [e for e in items if e["kind"] == "tool"]
+        self.assertEqual([e["status"] for e in tools], ["done", "done", "error"])
+        self.assertIn("already used its two subagents", tools[-1]["output"])
+        self.assertEqual(len(self.model.requests), 4)
+        result = self.model.requests[-1]["body"]["messages"][-1]["content"][-1]
+        self.assertEqual(result["tool_use_id"], "toolu_2")
+        self.assertTrue(result["is_error"])
+
+    def test_stop_interrupts_a_silent_delegate(self):
+        self.model.script += [
+            anthropic_stream([{"type": "tool_use", "id": "toolu_child", "name": "delegate_task",
+                               "input": {"task": "Inspect the note"}}], "tool_use"),
+            self.model.hang,
+        ]
+        thread_id = self.post("/v1/threads", {"workspace": "demo", "prompt": "Delegate the inspection"}, 201)["id"]
+        deadline = time.monotonic() + 5
+        while len(self.model.requests) < 2:
+            self.assertLess(time.monotonic(), deadline, "the child model was never called")
+            time.sleep(0.02)
+        started = time.monotonic()
+        self.post(f"/v1/threads/{thread_id}/interrupt", {})
+        thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle", timeout=5)
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertIsNone(thread["error"])
+        tool = next(e for e in items if e["kind"] == "tool")
+        self.assertEqual(tool["status"], "cancelled")
+        self.assertTrue(items[-1]["stopped"])
+        self.assertEqual(len(self.model.requests), 2)
+        self.model.script.append(anthropic_stream([{"type": "text", "text": "OK."}], "end_turn"))
+        self.post(f"/v1/threads/{thread_id}/messages", {"text": "Never mind"}, 202)
+        self.thread_until(thread_id, lambda t, _: t["state"] == "idle" and t["runs"] == 2)
+        history = self.model.requests[-1]["body"]["messages"]
+        result = next(b for m in history if m["role"] == "user" for b in m["content"] if b["type"] == "tool_result")
+        self.assertEqual(result["tool_use_id"], "toolu_child")
+        self.assertTrue(result["is_error"])
+
+    def test_session_message_requires_approval_and_uses_the_targets_context(self):
+        self.model.script.append(openai_stream(content="I am ready."))
+        target_id = self.post("/v1/threads", {"workspace": "isolated", "provider": "local", "mode": "full",
+                              "prompt": "Target-only context"}, 201)["id"]
+        target, _ = self.thread_until(target_id, lambda t, _: t["state"] == "idle")
+        self.assertIsNone(target["error"])
+        self.model.script += [
+            openai_stream(calls=[("peer", "message_session", {"session_id": target_id, "message": "What is the first line?"})],
+                          finish="tool_calls"),
+            openai_stream(calls=[("read", "read_file", {"path": "notes.txt"}),
+                                 ("write", "write_file", {"path": "forbidden.txt", "content": "no"}),
+                                 ("cascade", "message_session", {"session_id": "a" * 24, "message": "Ping"})], finish="tool_calls"),
+            openai_stream(content="The first line is committed base."),
+            openai_stream(content="I heard back from the other session."),
+        ]
+        source_id = self.post("/v1/threads", {"workspace": "demo", "provider": "local", "mode": "full",
+                              "prompt": "Source-only context"}, 201)["id"]
+        source, _ = self.thread_until(source_id, lambda t, _: t["state"] == "waiting")
+        # Changing modes must not implicitly approve privacy-sensitive messages.
+        self.post(f"/v1/threads/{source_id}/settings", {"mode": "full"})
+        self.assertEqual(self.api("GET", f"/v1/threads/{target_id}")["thread"]["runs"], 1)
+        self.post(f"/v1/threads/{source_id}/approval", {"call": source["pendingCall"], "decision": "allow"})
+        source, items = self.thread_until(source_id, lambda t, _: t["state"] == "idle")
+        self.assertIsNone(source["error"])
+        tool = next(e for e in items if e.get("name") == "message_session")
+        self.assertEqual(tool["status"], "done")
+        self.assertIn("The first line is committed base.", tool["output"])
+        target_page = self.api("GET", f"/v1/threads/{target_id}")
+        self.assertEqual((target_page["thread"]["runs"], target_page["thread"]["mode"]), (2, "full"))
+        self.assertTrue(any(f"Message from session {source_id}" in e.get("text", "") for e in target_page["items"]))
+
+        target_request = self.model.requests[2]["body"]
+        self.assertEqual({t["function"]["name"] for t in target_request["tools"]}, {"read_file", "list_files"})
+        self.assertIn("Target-only context", json.dumps(target_request["messages"]))
+        self.assertNotIn("Source-only context", json.dumps(target_request["messages"]))
+        results = {m["tool_call_id"]: m["content"] for m in self.model.requests[3]["body"]["messages"] if m["role"] == "tool"}
+        self.assertIn("committed base", results["read"])
+        self.assertIn("can only read and list", results["write"])
+        self.assertIn("can only read and list", results["cascade"])
+        self.assertFalse((self.state / "worktrees" / f"isolated-{target_id}" / "forbidden.txt").exists())
+        returned = self.model.requests[4]["body"]["messages"][-1]
+        self.assertEqual(returned["content"], tool["output"])
+        self.assertNotIn("Target-only context", json.dumps(self.model.requests[4]["body"]["messages"]))
+
+        self.model.script.append(openai_stream(content="OK."))
+        self.post(f"/v1/threads/{target_id}/messages", {"text": "Back to work"}, 202)
+        self.thread_until(target_id, lambda t, _: t["state"] == "idle" and t["runs"] == 3)
+        self.assertNotIn("What is the first line?", json.dumps(self.model.requests[-1]["body"]["messages"]))
+
+    def test_stopping_a_session_message_cancels_the_targets_read_only_turn(self):
+        self.model.script.append(openai_stream(content="Ready."))
+        target_id = self.post("/v1/threads", {"workspace": "demo", "provider": "local", "prompt": "Target"}, 201)["id"]
+        self.thread_until(target_id, lambda t, _: t["state"] == "idle")
+        self.model.script += [
+            openai_stream(calls=[("peer", "message_session", {"session_id": target_id, "message": "Check the notes."})],
+                          finish="tool_calls"),
+            self.model.hang,
+        ]
+        source_id = self.post("/v1/threads", {"workspace": "demo", "provider": "local", "prompt": "Ask the target"}, 201)["id"]
+        source, _ = self.thread_until(source_id, lambda t, _: t["state"] == "waiting")
+        self.post(f"/v1/threads/{source_id}/approval", {"call": source["pendingCall"], "decision": "allow"})
+        deadline = time.monotonic() + 5
+        while len(self.model.requests) < 3:
+            self.assertLess(time.monotonic(), deadline, "the target model was never called")
+            time.sleep(0.02)
+        self.post(f"/v1/threads/{source_id}/interrupt", {})
+        source, items = self.thread_until(source_id, lambda t, _: t["state"] == "idle", timeout=5)
+        target, target_items = self.thread_until(target_id, lambda t, _: t["state"] == "idle", timeout=5)
+        self.assertIsNone(source["error"])
+        self.assertIsNone(target["error"])
+        self.assertEqual(next(e for e in items if e.get("name") == "message_session")["status"], "cancelled")
+        self.assertEqual(target_items[-1]["text"], "Stopped.")
+        self.assertEqual(len(self.model.requests), 3)
+
+    def test_web_tools_block_nonpublic_urls_and_report_when_search_is_unconfigured(self):
+        calls = [("loopback", "web_fetch", {"url": "http://127.0.0.1/"}),
+                 ("local_file", "web_fetch", {"url": "file:///etc/passwd"}),
+                 ("search", "web_search", {"query": "example documentation"})]
+        self.model.script += [openai_stream(calls=calls, finish="tool_calls"), openai_stream(content="Done.")]
+        thread_id = self.post("/v1/threads", {"workspace": "demo", "provider": "local", "mode": "full",
+                               "prompt": "Use the web tools"}, 201)["id"]
+        _, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle")
+        tools = [e for e in items if e["kind"] == "tool"]
+        self.assertEqual([e["status"] for e in tools], ["error", "error", "error"])
+        self.assertIn("Private and reserved", tools[0]["output"])
+        self.assertIn("public HTTP or HTTPS", tools[1]["output"])
+        self.assertIn("BRAVE_SEARCH_API_KEY", tools[2]["output"])
 
     def test_agent_interrupts_a_silent_model(self):
         self.model.script.append(self.model.hang)

@@ -38,9 +38,11 @@ public:
 private:
     using Clock = std::chrono::system_clock;
     struct Thread;
+    struct PeerRequest;
 
     std::shared_ptr<Thread> find(std::string_view id) const;
-    void start_run(const std::shared_ptr<Thread>& thread, std::string prompt);
+    void start_run(const std::shared_ptr<Thread>& thread, std::string prompt, std::shared_ptr<PeerRequest> peer = {});
+    ToolOutcome message_session(Thread& source, const ToolCall& call);
     void work(std::shared_ptr<Thread> thread);
     void run_steps(Thread& thread);
     bool prepare(Thread& thread);

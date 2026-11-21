@@ -288,10 +288,12 @@ Json list_directory(const FileRoot& workspace, std::string_view path) {
     return {{"entries", std::move(files)}, {"truncated", truncated}};
 }
 
-TextFile read_text(const FileRoot& workspace, std::string_view path) {
+TextFile read_text(const FileRoot& workspace, std::string_view path, std::size_t max_bytes) {
     const auto file = open_regular(workspace, locate(workspace, path));
-    if (file.info.st_size > static_cast<off_t>(text_limit)) throw Error(413, "Text editor limit is 1 MiB");
-    auto text = read_bounded(file.fd, text_limit);
+    if (static_cast<std::uintmax_t>(file.info.st_size) > max_bytes) {
+        throw Error(413, max_bytes == text_limit ? "Text editor limit is 1 MiB" : "File is too large");
+    }
+    auto text = read_bounded(file.fd, max_bytes);
     if (!utf8_text(text)) throw Error(415, "Not a UTF-8 text file; download it instead");
     const auto revision = revision_of(file.info);
     if (revision != revision_of(stat_fd(file.fd))) throw Error(409, "File changed while reading; reopen it");

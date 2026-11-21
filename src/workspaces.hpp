@@ -92,7 +92,7 @@ struct Download {
 Configuration load_config(const char* state_path);
 FileRoot open_file_root(const char* path);
 Json list_directory(const FileRoot& root, std::string_view path);
-TextFile read_text(const FileRoot& root, std::string_view path);
+TextFile read_text(const FileRoot& root, std::string_view path, std::size_t max_bytes = text_limit);
 std::string write_text(const FileRoot& root, std::string_view path,
                        std::string_view text, std::string_view revision);
 Download open_download(const FileRoot& root, std::string_view path);

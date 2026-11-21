@@ -4,7 +4,7 @@ A native Android workbench for your existing Debian chroot. Start a coding-agent
 
 ## Run the daemon in Debian
 
-You need Linux with glibc 2.34+, a C++20 compiler, CMake 3.22+, OpenSSL 3, Git, and Python 3. On Debian, install any missing packages with `apt install build-essential cmake libssl-dev openssl git python3`. CMake fetches two pinned header dependencies on the first build. Use the daemon and APK from the same version.
+You need Linux with glibc 2.34+, a C++20 compiler, CMake 3.22+, OpenSSL 3, Git, and Python 3. On Debian, install any missing packages with `apt install build-essential cmake libssl-dev libxml2-dev ca-certificates openssl git python3`. CMake fetches two pinned header dependencies on the first build. Use the daemon and APK from the same version.
 
 ```sh
 cd /root/mobile-harness
@@ -17,13 +17,21 @@ state="${XDG_STATE_HOME:-$HOME/.local/state}/tsun-demo/state"
 ./build/mobile-harness "$state"
 ```
 
-Start it in your normal Debian shell, or keep it in a named shell session while trying the app. A plain chroot shares the phone's loopback. The app and the daemon must share that network namespace.
+For manual startup, leave the last command running in Debian. If you use the Android root launcher below, stop the manual instance after testing; the app can start it on demand. The app and the daemon must share the phone's loopback network namespace.
 
 ## Install and pair
 
 Push this project to a GitHub repo with Actions enabled. The **Tsun CI** workflow builds and tests the daemon and builds/lints a debug APK without using the phone's Android toolchain. In the Actions run, download **Tsun-debug**, unzip it, and sideload `app-debug.apk` (Android 8+). These are debug builds; a later CI build may use a different debug signing key, in which case Android will require uninstalling the old build before installing the new one.
 
-From another shell in Debian, print the private code and paste it into the app:
+### Start from the app (rooted Android)
+
+For the standard Termux `chroot-distro login debian` setup, grant Tsun (`dev.tsun.app`) root in KernelSU and choose **Pair via root**. If you previously paired with a code, forget that pairing first to opt in. The launcher expects the built daemon at `/root/mobile-harness/build/mobile-harness` and an initialized state at `/root/.local/state/tsun-demo/state`, both inside Debian.
+
+Tsun reads that state's pairing locally. If the paired port refuses the connection, it starts the daemon with a non-interactive `chroot-distro login debian` command and reconnects over pinned HTTPS. Termux need not be open, but its installation and Debian container must remain installed. The daemon starts on demand, not at boot, and is detached from the activity. On failure, check `STATE_DIR/launcher.log` in Debian. The launcher does not load interactive shell settings; use `apiKeyFile` for provider keys. Forgetting the pairing disables Tsun's launcher; revoke the app's root grant separately in KernelSU.
+
+### Pair manually
+
+For other layouts or if you don't want to grant the app root, start the daemon yourself, then print the private code in another Debian shell and paste it into the app:
 
 ```sh
 cd /root/mobile-harness
@@ -34,14 +42,18 @@ Don't post the code or commit the state directory. Pairing pins the daemon certi
 
 To try the agent, save an Anthropic API key as `STATE_DIR/anthropic-key` (mode 0600) before starting the daemon, then type a task in the app and send it. Without a key, the app explains what is missing and the presets still work.
 
-To try presets, open **Presets** in the composer and choose **Demo report**. Start **Demo checks** from a new session too. Switch between sessions under **Field Notes** in the drawer. **Files** opens the selected session's worktree: try editing `notes.txt`, opening `artifacts/report.html`, or exporting `artifacts/field.png`. The file icon next to a project in the drawer opens the original checkout instead. The demo is a separate Git repo outside the source checkout.
+`init-demo.sh` starts with an empty Git workspace. To try the sample files and presets, run `bash scripts/init-demo.sh --samples /path/to/a/new/demo`. **Files** opens the selected session's worktree; the file icon next to a project opens its original checkout. Existing workspaces are not rewritten.
 
 ## Agent sessions
 
 A session is a conversation with a coding agent about one project. The daemon runs the loop itself (stream the model's reply, run the tools it asks for, send back the results, repeat until it answers). The design follows [T3 Code](https://github.com/pingdotgg/t3code): a thread holds runs (one per message you send), a run holds items (text, reasoning, tool calls, approvals, notices), and the app catches up with a revision cursor instead of re-reading the conversation.
 
-- **Tools.** Every provider gets the same JSON-schema tools: `bash`, `read_file`, `write_file`, `edit_file`, `list_files`, and `search`. File tools stay inside the session's worktree, never follow symlinks, and leave `.git` alone. Each `bash` call is a fresh non-interactive shell in the worktree with a time limit.
-- **Permission modes.** *Ask first* asks before every edit and command. *Auto-edit* (the default) applies edits and asks before commands. *Full access* asks for nothing. You can change the mode while the agent waits; widening it answers the pending request.
+- **Tools.** Every provider gets the same JSON-schema tools. Use `read_file`, `write_file`, `edit_file`, `list_files`, and `search` to work with files. Each `bash` call is a fresh non-interactive shell in the worktree with a time limit.
+- **Project instructions.** Tsun loads the active workspace root's `AGENTS.md` into the system prompt at the start of each turn and shares that snapshot with subagents. On an isolated session, this is the session's Git worktree. The configured model provider receives this guidance. Tsun skips files over 16 KiB, non-UTF-8 files, and links. The agent looks for more specific instructions near affected files as needed.
+- **Subagents.** Inspired by T3 Code's `delegate_task`: the agent can send a focused brief to a fresh, read-only child using the same workspace and model. The child's conversation starts with the brief. The child can read and list workspace files but cannot use the shell, edit, or delegate. It runs in the foreground, counts toward provider usage, and returns findings in an expandable **Subagent** card. Stop cancels it along with the parent. Up to two children per message, one at a time, with a two-minute and eight-step budget each. There are no background tasks or separate child sessions.
+- **Permission modes.** *Ask first* asks before every edit and command. *Auto-edit* (the default) applies edits and asks before commands. *Full access* runs edits and commands without asking. The app remembers your last explicitly selected mode for new sessions until you forget the pairing. Session messaging always asks for permission.
+- **Web tools.** `web_fetch` reads text or HTML from public HTTP(S) URLs on default ports, with no redirects, cookies, or private network addresses. `web_search` uses the Brave Search API when `BRAVE_SEARCH_API_KEY` is set in the daemon environment. Queries are sent to Brave; don't include private information. Web requests require approval outside Full access.
+- **Session messaging.** Tap the branch chip (or **Session ID** for a shared workspace) to copy the ID. Ask another session to consult that ID. After approval, `message_session` asks the idle target a read-only question using its own history and workspace. The answer appears in both conversations. Busy sessions are not interrupted; the target cannot edit, run commands, or relay the request to other sessions.
 - **Worktrees and checkpoints.** A session on a Git workspace gets a `tsun/agent-…` branch under `STATE_DIR/worktrees/`. After each run, the daemon snapshots the worktree as a commit under the hidden ref `refs/tsun/checkpoints/<thread>/<run>`, without adding commits to the branch, and reports the run's diff. **Review changes** shows everything the session changed since it branched.
 - **Switching models.** Pick a different model in the composer before sending; the conversation carries over. The daemon keeps a provider-neutral transcript and replays each provider's native reply (including Claude's reasoning blocks) unchanged when the same model continues.
 
@@ -76,7 +88,7 @@ Edit `config.json` inside your daemon state directory, then restart the daemon. 
 
 A preset is a fixed `argv` array with an absolute executable as its first element. Use `/usr/bin/git`, `/usr/bin/curl`, or your Debian build tools as appropriate. Presets start in the selected worktree and inherit the daemon's environment, including its `PATH`. Use project-relative paths to keep their output in the worktree. Keep installs and root maintenance manual.
 
-- The daemon binds HTTPS to `127.0.0.1` only. The app never needs root or direct access to `/root`. Don't expose the port over a tunnel or use this on a shared device you don't trust.
+- The daemon binds HTTPS to `127.0.0.1` only. Manual pairing does not need app root access. **Pair via root** is optional and runs fixed startup and pairing commands via `su`; agent traffic, file access, and approvals still use the pinned daemon API. Don't expose the port over a tunnel or use this on a shared device you don't trust.
 - **Presets and agents are not sandboxed.** They run with the daemon's user privileges. An agent in *Auto-edit* or *Full access* mode runs model-chosen code without asking first, so treat it like a person with a shell on your Debian account. Model replies, tool output, and file contents go to the provider you configured. Use an unprivileged Debian account where the repo permits it, and only configure repos and presets you trust. Stop targets the job's process group, not programs that detach from it. Presets should not start daemons.
 - Text edits use revision checks and atomic replacement. V0 doesn't create or delete files, show dotfiles, or follow symlinks. The API caps text at 1 MiB and downloads at 64 MiB; the phone editor caps editing at 128 Ki characters. HTML preview is static and offline: use inline CSS and embedded data assets. Unsaved drafts are not durable.
 - Preset run history and the last 64 KiB of each run's output are kept in memory until the daemon exits (up to 32 runs). Worktrees and branches stay on disk after Stop or restart, but old tasks are not rediscovered by the app. Use `git worktree list` from the original checkout to find them. Review and commit any changes you want to keep before removing a finished worktree manually. Tsun never merges, pushes, or deletes task branches automatically.

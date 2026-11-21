@@ -1,5 +1,7 @@
 package dev.tsun.app
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.BorderStroke
@@ -27,6 +29,8 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.input.clearText
+import androidx.compose.foundation.text.input.rememberTextFieldState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -39,18 +43,25 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -58,9 +69,12 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 
 // ---- A live agent thread -----------------------------------------------------
+
+private data class TranscriptRow(val id: String, val entry: MutableState<ThreadItem>)
 
 @Composable
 internal fun ThreadScreen(
@@ -71,6 +85,7 @@ internal fun ThreadScreen(
     handlesBack: Boolean,
     onBack: () -> Unit,
     onThread: (AgentThread) -> Unit,
+    onMode: (Mode) -> Unit,
     onReview: () -> Unit,
     onFiles: () -> Unit,
 ) {
@@ -78,28 +93,49 @@ internal fun ThreadScreen(
     val scope = rememberCoroutineScope()
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     var thread by remember(threadId) { mutableStateOf(initial) }
-    var items by remember(threadId) { mutableStateOf<Map<String, ThreadItem>>(emptyMap()) }
+    val rows = remember(threadId) { mutableStateListOf<TranscriptRow>() }
+    val byId = remember(threadId) { mutableMapOf<String, TranscriptRow>() }
     var cursor by remember(threadId) { mutableLongStateOf(0L) }
+    var actionVersion by remember(threadId) { mutableLongStateOf(0L) }
+    val publishThread by rememberUpdatedState(onThread)
     var loaded by remember(threadId) { mutableStateOf(false) }
     var offline by remember(threadId) { mutableStateOf<String?>(null) }
     var actionError by remember(threadId) { mutableStateOf<String?>(null) }
     var busy by remember(threadId) { mutableStateOf(false) }
-    var draft by rememberSaveable(threadId) { mutableStateOf("") }
+    val draft = rememberTextFieldState()
     var providerId by rememberSaveable(threadId) { mutableStateOf<String?>(null) }
 
     LaunchedEffect(api, threadId, lifecycle) {
         lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
             while (true) {
                 try {
+                    val version = actionVersion
                     val page = api.thread(threadId, cursor, if (loaded) 2000 else 0)
-                    val merged = if (page.reset) LinkedHashMap() else LinkedHashMap(items)
-                    for (entry in page.items) merged[entry.id] = entry
-                    items = merged
+                    if (page.reset || page.items.isNotEmpty()) Snapshot.withMutableSnapshot {
+                        if (page.reset) {
+                            rows.clear()
+                            byId.clear()
+                        }
+                        for (entry in page.items) {
+                            val row = byId[entry.id]
+                            if (row != null) row.entry.value = entry
+                            else {
+                                val added = TranscriptRow(entry.id, mutableStateOf(entry))
+                                byId[entry.id] = added
+                                rows.add(added)
+                            }
+                        }
+                    }
                     cursor = page.rev
-                    thread = page.thread
-                    onThread(page.thread)
+                    // A poll started before a local action can carry an older summary.
+                    if (version == actionVersion && thread != page.thread) {
+                        thread = page.thread
+                        publishThread(page.thread)
+                    }
                     loaded = true
                     offline = null
+                    // Batch bursty deltas instead of repainting once per token.
+                    if (page.thread.active && page.items.isNotEmpty()) delay(80)
                 } catch (e: Exception) {
                     offline = e.userMessage()
                     delay(1500)
@@ -117,34 +153,33 @@ internal fun ThreadScreen(
         scope.launch {
             try {
                 val updated = block()
+                actionVersion++
                 thread = updated
-                onThread(updated)
+                publishThread(updated)
             } catch (e: Exception) { actionError = e.userMessage() }
             finally { busy = false }
         }
     }
 
-    val ordered = items.values.toList()
     Column(Modifier.fillMaxSize()) {
         if (current != null) ThreadChips(current, onReview, onFiles)
-        Conversation(ordered, current, loaded, Modifier.weight(1f),
+        Conversation(rows, current, loaded, Modifier.weight(1f),
             onDecide = { call, allow -> act { api.decide(threadId, call, allow) } },
             onReview = onReview)
         (offline ?: actionError)?.let {
             Notice(it, Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), error = true)
         }
         Composer(
-            text = draft, onText = { draft = it },
+            draft = draft,
             placeholder = if (current?.active == true) "The agent is working…" else "Reply…",
             mode = current?.mode ?: Mode.Edits,
-            onMode = { mode -> act { api.setMode(threadId, mode) } },
+            onMode = { mode -> act { api.setMode(threadId, mode).also { onMode(it.mode) } } },
             providers = providers, provider = provider, onProvider = { providerId = it.id },
             working = current?.active == true, canSend = current != null && provider?.enabled != false, busy = busy,
-            onSend = {
-                val text = draft.trim()
+            onSend = { text ->
                 val switch = providerId?.takeIf { it != current?.provider }
                 act {
-                    api.reply(threadId, text, current?.mode ?: Mode.Edits, switch).also { draft = "" }
+                    api.reply(threadId, text, switch).also { draft.clearText() }
                 }
             },
             onStop = { act { api.interrupt(threadId) } },
@@ -155,9 +190,16 @@ internal fun ThreadScreen(
 
 @Composable
 private fun ThreadChips(thread: AgentThread, onReview: () -> Unit, onFiles: () -> Unit) {
+    val context = LocalContext.current
+    val copyId = {
+        context.getSystemService(ClipboardManager::class.java)
+            ?.setPrimaryClip(ClipData.newPlainText("Tsun session ID", thread.id))
+        Unit
+    }
     Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 6.dp),
         horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
-        thread.branch?.let { Chip(it.removePrefix("tsun/"), glyph = Glyph.Branch, mono = true) }
+        Chip(thread.branch?.removePrefix("tsun/") ?: "Session ID", glyph = Glyph.Branch, mono = true,
+            modifier = Modifier.semantics { contentDescription = "Copy session ID" }, onClick = copyId)
         if (thread.branch != null) {
             Row(Modifier.clip(Pill).background(inks.wash).clickable(role = Role.Button, onClick = onReview)
                 .heightIn(min = 32.dp).padding(horizontal = 11.dp), verticalAlignment = Alignment.CenterVertically,
@@ -177,7 +219,7 @@ private fun ThreadChips(thread: AgentThread, onReview: () -> Unit, onFiles: () -
 
 @Composable
 private fun Conversation(
-    entries: List<ThreadItem>, thread: AgentThread?, loaded: Boolean, modifier: Modifier,
+    entries: List<TranscriptRow>, thread: AgentThread?, loaded: Boolean, modifier: Modifier,
     onDecide: (String, Boolean) -> Unit, onReview: () -> Unit,
 ) {
     val list = rememberLazyListState()
@@ -186,25 +228,42 @@ private fun Conversation(
         list.interactionSource.interactions.collect { if (it is DragInteraction.Start) follow = false }
     }
     LaunchedEffect(list) {
-        snapshotFlow { list.canScrollForward }.collect { more -> if (!more) follow = true }
+        snapshotFlow { !list.canScrollForward && !list.isScrollInProgress }.collect { atEnd ->
+            if (atEnd) follow = true
+        }
     }
-    val tail = entries.lastOrNull()
-    val tailSize = when (tail) {
-        is ThreadItem.Text -> tail.text.length
-        is ThreadItem.Thinking -> tail.text.length
-        is ThreadItem.Tool -> tail.status.length + (tail.output?.length ?: 0)
-        else -> 0
+    val active by rememberUpdatedState(thread?.active == true)
+    val ready by rememberUpdatedState(loaded)
+    LaunchedEffect(list, entries) {
+        snapshotFlow {
+            if (!follow || entries.isEmpty()) null
+            else {
+                val tail = entries.last()
+                val end = entries.size + (if (active) 1 else 0) + (if (ready) 0 else 1)
+                val tailHeight = list.layoutInfo.visibleItemsInfo.lastOrNull { it.key == tail.id }?.size
+                Triple(end, tail.entry.value, tailHeight)
+            }
+        }.collect { change ->
+            if (change != null && follow && !list.isScrollInProgress) list.requestScrollToItem(change.first)
+        }
     }
-    LaunchedEffect(entries.size, tailSize, thread?.state) {
-        if (follow && entries.isNotEmpty()) list.scrollToItem(entries.size + 1)
+    LaunchedEffect(list, entries) {
+        // Let the keyboard resize the pane without scheduling a scroll on every animation frame.
+        snapshotFlow { list.layoutInfo.viewportSize.height }.collectLatest {
+            delay(100)
+            if (follow && entries.isNotEmpty() && list.canScrollForward && !list.isScrollInProgress) {
+                val end = entries.size + (if (active) 1 else 0) + (if (ready) 0 else 1)
+                list.requestScrollToItem(end)
+            }
+        }
     }
     Box(modifier.fillMaxWidth()) {
         LazyColumn(Modifier.fillMaxSize(), state = list,
             contentPadding = PaddingValues(start = 18.dp, end = 18.dp, top = 8.dp, bottom = 16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)) {
             if (!loaded) item { Text("Loading…", color = inks.faint, style = MaterialTheme.typography.bodyMedium) }
-            items(entries, key = { it.id }) { entry ->
-                when (entry) {
+            items(entries, key = { it.id }) { row ->
+                when (val entry = row.entry.value) {
                     is ThreadItem.User -> UserTurn(entry.text)
                     is ThreadItem.Text -> if (entry.text.isNotBlank()) {
                         SelectionContainer { MarkdownText(entry.text, Modifier.fillMaxWidth()) }
@@ -216,7 +275,9 @@ private fun Conversation(
                     is ThreadItem.RunEnd -> RunSummary(entry, onReview)
                 }
             }
-            if (thread != null && thread.active) item(key = "working") { WorkingLine(thread, tail) }
+            if (thread != null && thread.active) item(key = "working") {
+                WorkingLine(thread, entries.lastOrNull()?.entry?.value)
+            }
             item(key = "end") { Spacer(Modifier.height(1.dp)) }
         }
         if (!follow && entries.isNotEmpty()) {
@@ -262,6 +323,8 @@ private fun toolGlyph(name: String) = when (name) {
     "read_file" -> Glyph.Eye
     "search" -> Glyph.Search
     "list_files" -> Glyph.Folder
+    "delegate_task", "message_session" -> Glyph.Branch
+    "web_fetch", "web_search" -> Glyph.Search
     else -> Glyph.File
 }
 
@@ -310,8 +373,14 @@ private fun Approval(entry: ThreadItem.Tool, onDecide: (String, Boolean) -> Unit
     Column(Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, bottom = 12.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)) {
         if (entry.name == "bash") CodeBlock(entry.detail)
+        if (entry.name == "message_session" || entry.name == "web_search" || entry.name == "web_fetch") {
+            SelectionContainer { Text(entry.detail, style = SmallCode, color = inks.quiet) }
+        }
         Text(when (entry.name) {
             "bash" -> "Run this command in the worktree?"
+            "message_session" -> "Send this question to the other session?"
+            "web_search" -> "Send this search query to Brave?"
+            "web_fetch" -> "Fetch this public web page?"
             "write_file" -> "Write this file?"
             else -> "Apply this edit?"
         }, style = MaterialTheme.typography.bodyMedium, color = inks.ink)
@@ -334,6 +403,7 @@ private fun ToolDetail(entry: ThreadItem.Tool) {
     Column(Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, bottom = 12.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp)) {
         when {
+            (entry.name == "delegate_task" || entry.name == "message_session") && entry.output != null -> MarkdownText(entry.output)
             entry.name == "edit_file" && entry.after != null -> EditPreview(entry.before.orEmpty(), entry.after)
             entry.name == "write_file" && entry.after != null ->
                 if (entry.created) EditPreview("", entry.after) else EditPreview(entry.before.orEmpty(), entry.after)
@@ -363,7 +433,7 @@ private fun OutputBlock(text: String) {
     }
 }
 
-/** Old text in clay-red, new text in sage, like a small unified diff. */
+/** Old text in rust, new text in sage, like a small unified diff. */
 @Composable
 internal fun EditPreview(before: String, after: String) {
     val removed = if (before.isEmpty()) emptyList() else before.trimEnd('\n').lines()
@@ -436,13 +506,14 @@ internal fun NewSessionScreen(
     online: Boolean,
     busy: Boolean,
     error: String?,
+    mode: Mode,
+    onMode: (Mode) -> Unit,
     onWorkspace: (Workspace) -> Unit,
     onStart: (prompt: String, mode: Mode, provider: String?) -> Unit,
     onPreset: (Preset) -> Unit,
     onOpen: (AgentThread) -> Unit,
 ) {
-    var draft by rememberSaveable { mutableStateOf("") }
-    var mode by rememberSaveable { mutableStateOf(Mode.Edits) }
+    val draft = rememberTextFieldState()
     var providerId by rememberSaveable { mutableStateOf<String?>(null) }
     val provider = providers.firstOrNull { it.id == (providerId ?: defaultProvider) }
         ?: providers.firstOrNull { it.enabled }
@@ -468,12 +539,12 @@ internal fun NewSessionScreen(
         }
         error?.let { Notice(it, Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), error = true) }
         Composer(
-            text = draft, onText = { draft = it },
+            draft = draft,
             placeholder = if (workspace != null) "Describe a task for ${workspace.label}…" else "Describe a task…",
-            mode = mode, onMode = { mode = it },
+            mode = mode, onMode = onMode,
             providers = providers, provider = provider, onProvider = { providerId = it.id },
             working = false, canSend = online && workspace != null && provider?.enabled == true, busy = busy,
-            onSend = { onStart(draft.trim(), mode, provider?.id) },
+            onSend = { onStart(it, mode, provider?.id) },
             onStop = {},
             modifier = Modifier.padding(start = 12.dp, end = 12.dp, top = 6.dp, bottom = 10.dp),
             leading = {

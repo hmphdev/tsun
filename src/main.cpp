@@ -192,10 +192,20 @@ int serve(const tsun::Configuration& config, httplib::SSLServer& server) {
         if (response.body.empty()) problem(response, response.status, httplib::status_message(response.status));
     });
 
-    server.Get("/v1/workspaces", [&](const Request&, Response& res) {
-        auto catalog = config.catalog();
-        catalog["agent"] = agents.providers().catalog();
-        respond(res, catalog);
+    const auto catalog = [&] {
+        auto value = config.catalog();
+        value["agent"] = agents.providers().catalog();
+        return value;
+    }();
+    server.Get("/v1/workspaces", [&](const Request& req, Response& res) {
+        if (find_query(req, "overview") == std::string_view("1")) {
+            auto overview = catalog;
+            overview["runs"] = jobs.list();
+            overview["threads"] = agents.list();
+            respond(res, overview);
+        } else {
+            respond(res, catalog);
+        }
     });
     server.Get("/v1/entries", [&](const Request& req, Response& res) {
         respond(res, tsun::list_directory(scope(req).root(), find_query(req, "path").value_or("")));

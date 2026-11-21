@@ -2,6 +2,8 @@ package dev.tsun.app
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -77,6 +79,7 @@ internal data class ModelProvider(
     val id: String, val label: String, val kind: String, val model: String, val enabled: Boolean, val reason: String?,
 )
 internal data class Catalog(val workspaces: List<Workspace>, val providers: List<ModelProvider>, val defaultProvider: String?)
+internal data class Overview(val catalog: Catalog, val runs: RunList, val threads: ThreadList)
 
 internal enum class Mode(val wire: String, val label: String, val hint: String) {
     Ask("ask", "Ask first", "Approve every edit and command"),
@@ -92,7 +95,7 @@ internal data class AgentThread(
     val id: String, val workspace: String, val title: String, val state: String, val mode: Mode,
     val provider: String, val providerLabel: String, val model: String, val branch: String?, val filesReady: Boolean,
     val runs: Int, val pendingCall: String?, val additions: Int, val deletions: Int, val filesChanged: Int,
-    val inputTokens: Long, val outputTokens: Long, val error: String?, val updatedAt: Long,
+    val error: String?,
 ) {
     val active get() = state != "idle"
 }
@@ -141,8 +144,24 @@ internal class DaemonApi(private val pairing: Pairing) {
         SSLContext.getInstance("TLS").apply { init(null, arrayOf(DaemonTrust(pairing.fingerprint)), null) }.socketFactory
     }
 
-    suspend fun catalog(): Catalog {
-        val response = json("/v1/workspaces")
+    suspend fun overview(): Overview {
+        val response = readJson("/v1/workspaces?overview=1") { body ->
+            val catalog = decodeCatalog(body)
+            val runs = body.optJSONObject("runs")?.runList()
+            val threads = body.optJSONObject("threads")?.threadList()
+            Triple(catalog, runs, threads)
+        }
+        val (catalog, runs, threads) = response
+        if (runs != null && threads != null) return Overview(catalog, runs, threads)
+        // Older protocol-3 daemons return just the catalog.
+        return coroutineScope {
+            val oldRuns = async { readJson("/v1/jobs") { it.runList() } }
+            val oldThreads = async { readJson("/v1/threads") { it.threadList() } }
+            Overview(catalog, oldRuns.await(), oldThreads.await())
+        }
+    }
+
+    private fun decodeCatalog(response: JSONObject): Catalog {
         if (response.getInt("protocol") != 3) throw ApiError(426, "Rebuild and restart the Tsun 0.3 daemon in Debian.")
         val workspaces = response.getJSONArray("workspaces").mapObjects { workspace ->
             Workspace(workspace.getString("id"), workspace.getString("label"), workspace.getBoolean("worktrees"),
@@ -158,24 +177,19 @@ internal class DaemonApi(private val pairing: Pairing) {
         return Catalog(workspaces, providers, agent.optStringOrNull("default"))
     }
 
-    suspend fun threads(): ThreadList {
-        val response = json("/v1/threads")
-        return ThreadList(response.getJSONArray("threads").mapObjects { it.thread() }, response.getInt("capacity"))
-    }
-
     /** Long-polls for up to [waitMs] when nothing changed since [since]. */
-    suspend fun thread(id: String, since: Long, waitMs: Int): ThreadPage {
-        val response = json("/v1/threads/${encode(id)}?since=$since&wait=$waitMs")
-        return ThreadPage(response.getJSONObject("thread").thread(), response.getLong("rev"),
-            response.getBoolean("reset"), response.getJSONArray("items").mapObjects { it.threadItem() }.filterNotNull())
-    }
+    suspend fun thread(id: String, since: Long, waitMs: Int): ThreadPage =
+        readJson("/v1/threads/${encode(id)}?since=$since&wait=$waitMs") { response ->
+            ThreadPage(response.getJSONObject("thread").thread(), response.getLong("rev"),
+                response.getBoolean("reset"), response.getJSONArray("items").mapObjects { it.threadItem() }.filterNotNull())
+        }
 
     suspend fun startThread(workspace: String, prompt: String, mode: Mode, provider: String?): AgentThread =
         post("/v1/threads", JSONObject().put("workspace", workspace).put("prompt", prompt).put("mode", mode.wire)
             .apply { if (provider != null) put("provider", provider) }).thread()
 
-    suspend fun reply(id: String, text: String, mode: Mode, provider: String?): AgentThread =
-        post("/v1/threads/${encode(id)}/messages", JSONObject().put("text", text).put("mode", mode.wire)
+    suspend fun reply(id: String, text: String, provider: String?): AgentThread =
+        post("/v1/threads/${encode(id)}/messages", JSONObject().put("text", text)
             .apply { if (provider != null) put("provider", provider) }).thread()
 
     suspend fun setMode(id: String, mode: Mode): AgentThread =
@@ -237,11 +251,6 @@ internal class DaemonApi(private val pairing: Pairing) {
         }
     }
 
-    suspend fun runs(): RunList {
-        val response = json("/v1/jobs")
-        return RunList(response.getJSONArray("jobs").mapObjects { it.run() }, response.getInt("capacity"))
-    }
-
     suspend fun transcript(id: String): Transcript {
         val response = json("/v1/jobs/${encode(id)}")
         return Transcript(response.run(), response.getString("log"), response.getBoolean("truncated"))
@@ -256,10 +265,11 @@ internal class DaemonApi(private val pairing: Pairing) {
     private suspend fun json(
         path: String, method: String = "GET", body: ByteArray? = null,
         contentType: String? = null, revision: String? = null, timeout: Int = 5000,
-    ): JSONObject = request(path, method, body, contentType, revision, timeout) { input, _ ->
-        // A 1 MiB UTF-8 file can be up to 6 MiB after JSON escaping control characters.
-        JSONObject(input.readBounded(8 * 1024 * 1024, "Response is too large.").toString(Charsets.UTF_8))
-    }
+    ): JSONObject = request(path, method, body, contentType, revision, timeout) { input, _ -> input.jsonResponse() }
+
+    // Decode lists and transcript pages on the I/O dispatcher along with the response body.
+    private suspend fun <T> readJson(path: String, decode: (JSONObject) -> T): T =
+        request(path) { input, _ -> decode(input.jsonResponse()) }
 
     private suspend fun <T> request(
         path: String, method: String = "GET", body: ByteArray? = null,
@@ -306,6 +316,10 @@ private fun fileRoute(endpoint: String, scope: FileScope, path: String): String 
 
 private fun encode(value: String): String = URLEncoder.encode(value, "UTF-8")
 
+private fun JSONObject.runList() = RunList(getJSONArray("jobs").mapObjects { it.run() }, getInt("capacity"))
+
+private fun JSONObject.threadList() = ThreadList(getJSONArray("threads").mapObjects { it.thread() }, getInt("capacity"))
+
 private fun JSONObject.run(): Run = Run(getString("id"), getString("workspace"), getString("label"),
     getString("state"), if (isNull("exitCode")) null else getInt("exitCode"),
     if (isNull("branch")) null else getString("branch"), getBoolean("filesReady"))
@@ -317,8 +331,7 @@ private fun JSONObject.thread(): AgentThread = AgentThread(
     mode = Mode.of(getString("mode")), provider = getString("provider"), providerLabel = getString("providerLabel"),
     model = getString("model"), branch = optStringOrNull("branch"), filesReady = getBoolean("filesReady"),
     runs = getInt("runs"), pendingCall = optStringOrNull("pendingCall"), additions = getInt("additions"),
-    deletions = getInt("deletions"), filesChanged = getInt("filesChanged"), inputTokens = getLong("inputTokens"),
-    outputTokens = getLong("outputTokens"), error = optStringOrNull("error"), updatedAt = getLong("updatedAt"),
+    deletions = getInt("deletions"), filesChanged = getInt("filesChanged"), error = optStringOrNull("error"),
 )
 
 private fun JSONObject.fileStat() = FileStat(getString("path"), getInt("additions"), getInt("deletions"), optBoolean("binary"))
@@ -342,6 +355,10 @@ private fun JSONObject.threadItem(): ThreadItem? {
 
 private fun <T> JSONArray.mapObjects(transform: (JSONObject) -> T): List<T> =
     List(length()) { transform(getJSONObject(it)) }
+
+// A 1 MiB UTF-8 file can be up to 6 MiB after JSON escaping control characters.
+private fun InputStream.jsonResponse() =
+    JSONObject(readBounded(8 * 1024 * 1024, "Response is too large.").toString(Charsets.UTF_8))
 
 private fun InputStream.readBounded(limit: Int, error: String): ByteArray {
     val result = ByteArrayOutputStream()

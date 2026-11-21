@@ -9,12 +9,12 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
@@ -28,25 +28,24 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.Typography
 import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
-import androidx.compose.runtime.getValue
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.scale
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -54,14 +53,12 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.LineBreak
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
-/**
- * One dark, warm palette. Surfaces are brown-blacks that sit on an ember-to-black
- * gradient; accents are clay, amber, and sage rather than saturated hues.
- */
+/** Tsun's paper and ink palettes, with pine for actions and separate status colors. */
 internal data class Inks(
     val paper: Color,      // deepest background
     val sheet: Color,      // drawer and cards
@@ -71,24 +68,27 @@ internal data class Inks(
     val ink: Color,        // primary text
     val quiet: Color,      // secondary text
     val faint: Color,      // tertiary text, idle dots
-    val accent: Color,     // clay: primary actions and focus
+    val accent: Color,     // pine: primary actions and focus
     val onAccent: Color,
     val accentWash: Color, // selected rows, approval tint
     val amber: Color,      // live work
     val sage: Color,       // success, additions
     val danger: Color,     // errors, deletions
-    val glowTop: Color,
-    val glowMid: Color,
 )
 
-private val Ember = Inks(
-    paper = Color(0xFF0C0A09), sheet = Color(0xFF15110F), raised = Color(0xFF1D1815), wash = Color(0xFF26201B),
-    rule = Color(0xFF2F2722), ink = Color(0xFFEFE7DC), quiet = Color(0xFFA69888), faint = Color(0xFF6F6359),
-    accent = Color(0xFFD58A5E), onAccent = Color(0xFF1B110B), accentWash = Color(0xFF34231A),
-    amber = Color(0xFFE2AD62), sage = Color(0xFFA9B27E), danger = Color(0xFFE07560),
-    glowTop = Color(0xFF2A1A12), glowMid = Color(0xFF15100D),
+private val Day = Inks(
+    paper = Color(0xFFF7F4ED), sheet = Color(0xFFFFFCF6), raised = Color(0xFFFBF8F1), wash = Color(0xFFEDE9DF),
+    rule = Color(0xFFD9D5CA), ink = Color(0xFF222A26), quiet = Color(0xFF62665D), faint = Color(0xFF64685E),
+    accent = Color(0xFF29594B), onAccent = Color(0xFFFFFCF6), accentWash = Color(0xFFE5EBDF),
+    amber = Color(0xFF78551F), sage = Color(0xFF416C52), danger = Color(0xFF994832),
 )
-private val LocalInks = staticCompositionLocalOf { Ember }
+private val Night = Inks(
+    paper = Color(0xFF202622), sheet = Color(0xFF282F29), raised = Color(0xFF2C342D), wash = Color(0xFF303831),
+    rule = Color(0xFF444F45), ink = Color(0xFFEDEAE0), quiet = Color(0xFFB4BCB0), faint = Color(0xFFA9B3A7),
+    accent = Color(0xFFB7D2BE), onAccent = Color(0xFF1F372B), accentWash = Color(0xFF33483A),
+    amber = Color(0xFFCEB07A), sage = Color(0xFFA6C5A8), danger = Color(0xFFF1AD97),
+)
+private val LocalInks = staticCompositionLocalOf { Day }
 internal val inks: Inks @Composable get() = LocalInks.current
 
 private val Reading = FontFamily(Font(R.font.newsreader))
@@ -111,7 +111,7 @@ private val Type = Typography(
     labelSmall = TextStyle(fontFamily = Interface, fontWeight = FontWeight.SemiBold, fontSize = 11.sp, lineHeight = 15.sp, letterSpacing = 1.2.sp),
 )
 /** Assistant prose: a reading serif, like a reply rather than a log. */
-internal val ProseType = TextStyle(fontFamily = Reading, fontSize = 17.sp, lineHeight = 26.sp)
+internal val ProseType = TextStyle(fontFamily = Reading, fontSize = 17.sp, lineHeight = 26.sp, lineBreak = LineBreak.Paragraph)
 internal val CodeType = TextStyle(fontFamily = Mono, fontSize = 12.5.sp, lineHeight = 19.sp)
 internal val SmallCode = TextStyle(fontFamily = Mono, fontSize = 11.5.sp, lineHeight = 17.sp)
 internal val Corner = RoundedCornerShape(14.dp)
@@ -119,35 +119,31 @@ internal val Pill = RoundedCornerShape(50)
 
 @Composable
 internal fun TsunTheme(content: @Composable () -> Unit) {
-    val palette = Ember
-    val colors = darkColorScheme(
+    val dark = isSystemInDarkTheme()
+    val palette = if (dark) Night else Day
+    val base = if (dark) darkColorScheme() else lightColorScheme()
+    val colors = base.copy(
         primary = palette.accent, onPrimary = palette.onAccent,
         primaryContainer = palette.accentWash, onPrimaryContainer = palette.ink,
         secondary = palette.accent, onSecondary = palette.onAccent,
         secondaryContainer = palette.accentWash, onSecondaryContainer = palette.ink,
-        tertiary = palette.amber, onTertiary = palette.onAccent,
+        tertiary = palette.accent, onTertiary = palette.onAccent,
+        tertiaryContainer = palette.accentWash, onTertiaryContainer = palette.ink,
         background = palette.paper, onBackground = palette.ink,
         surface = palette.sheet, onSurface = palette.ink,
         surfaceVariant = palette.wash, onSurfaceVariant = palette.quiet,
         outline = palette.faint, outlineVariant = palette.rule,
         surfaceContainerLowest = palette.paper, surfaceContainerLow = palette.sheet,
         surfaceContainer = palette.sheet, surfaceContainerHigh = palette.raised, surfaceContainerHighest = palette.wash,
-        surfaceTint = Color.Transparent, error = palette.danger, onError = palette.onAccent,
-        inverseSurface = palette.ink, inverseOnSurface = palette.paper, scrim = Color.Black,
+        surfaceTint = Color.Transparent,
+        error = palette.danger, onError = if (dark) palette.paper else palette.sheet,
+        errorContainer = lerp(palette.sheet, palette.danger, 0.10f), onErrorContainer = palette.danger,
+        inverseSurface = palette.ink, inverseOnSurface = palette.paper,
+        inversePrimary = if (dark) Day.accent else Night.accent, scrim = Color.Black,
     )
     CompositionLocalProvider(LocalInks provides palette) {
         MaterialTheme(colorScheme = colors, typography = Type, content = content)
     }
-}
-
-/** The app background: a low ember glow at the top that falls off into black. */
-internal fun Modifier.emberBackground(palette: Inks): Modifier = drawBehind {
-    drawRect(Brush.verticalGradient(0f to palette.glowTop, 0.38f to palette.glowMid, 1f to palette.paper))
-    drawRect(Brush.radialGradient(
-        colors = listOf(Color(0x33C9773F), Color.Transparent),
-        center = Offset(size.width * 0.5f, -size.width * 0.15f),
-        radius = size.width * 0.95f,
-    ))
 }
 
 @Composable
@@ -182,12 +178,12 @@ internal fun EmptyNote(title: String, message: String, modifier: Modifier = Modi
 
 @Composable
 internal fun StatusDot(color: Color, modifier: Modifier = Modifier, pulsing: Boolean = false, size: Int = 7) {
-    val alpha = if (pulsing) {
+    val pulse = if (pulsing) {
         val transition = rememberInfiniteTransition(label = "pulse")
-        val value by transition.animateFloat(0.35f, 1f, infiniteRepeatable(tween(850), RepeatMode.Reverse), label = "alpha")
-        value
-    } else 1f
-    Box(modifier.size(size.dp).alpha(alpha).background(color, CircleShape))
+        val opacity = transition.animateFloat(0.35f, 1f, infiniteRepeatable(tween(850), RepeatMode.Reverse), label = "alpha")
+        Modifier.graphicsLayer { alpha = opacity.value }
+    } else Modifier
+    Box(modifier.size(size.dp).then(pulse).background(color, CircleShape))
 }
 
 /** Small rounded chip used for project, branch, model, and mode. */
@@ -207,7 +203,7 @@ internal fun Chip(
     }
 }
 
-/** "+12 −3" in sage and clay-red. */
+/** "+12 −3" in sage and rust. */
 @Composable
 internal fun DiffStat(additions: Int, deletions: Int, modifier: Modifier = Modifier) {
     Row(modifier, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
