@@ -66,6 +66,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.zIndex
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.repeatOnLifecycle
@@ -203,7 +204,9 @@ private fun ThreadChips(thread: AgentThread, onReview: () -> Unit, onFiles: () -
             ?.setPrimaryClip(ClipData.newPlainText("Tsun session ID", thread.id))
         Unit
     }
-    Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 6.dp),
+    // Keep the header above the transcript while its restored scroll position is laid out.
+    Row(Modifier.fillMaxWidth().zIndex(1f).clipToBounds().background(inks.paper)
+        .horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 6.dp),
         horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
         Chip(thread.branch?.removePrefix("tsun/") ?: "Session ID", glyph = Glyph.Branch, mono = true,
             modifier = Modifier.semantics { contentDescription = "Copy session ID" }, onClick = copyId)
@@ -229,31 +232,41 @@ private fun Conversation(
     entries: List<TranscriptRow>, thread: AgentThread?, loaded: Boolean, modifier: Modifier,
     onDecide: (String, Boolean) -> Unit, onReview: () -> Unit,
 ) {
+    val pane = modifier.fillMaxWidth().clipToBounds()
+    if (!loaded) {
+        // Don't lay out a session's restored scroll position against a loading-only list.
+        Box(pane.padding(start = 18.dp, end = 18.dp, top = 8.dp)) {
+            Text("Loading…", color = inks.faint, style = MaterialTheme.typography.bodyMedium)
+        }
+        return
+    }
+
     val list = rememberLazyListState()
-    var follow by remember { mutableStateOf(true) }
+    var follow by rememberSaveable { mutableStateOf(true) }
     LaunchedEffect(list) {
         list.interactionSource.interactions.collect { if (it is DragInteraction.Start) follow = false }
     }
     LaunchedEffect(list) {
-        snapshotFlow { !list.canScrollForward && !list.isScrollInProgress }.collect { atEnd ->
+        snapshotFlow {
+            list.layoutInfo.totalItemsCount > 0 && !list.canScrollForward && !list.isScrollInProgress
+        }.collect { atEnd ->
             if (atEnd) follow = true
         }
     }
     val active by rememberUpdatedState(thread?.active == true)
-    val ready by rememberUpdatedState(loaded)
     LaunchedEffect(list, entries) {
         snapshotFlow {
-            if (!follow || entries.isEmpty()) null
+            val lastIndex = list.layoutInfo.totalItemsCount - 1
+            if (!follow || entries.isEmpty() || lastIndex < 0) null
             else {
                 val tail = entries.last()
-                val end = entries.size + (if (active) 1 else 0) + (if (ready) 0 else 1)
+                val end = entries.size + (if (active) 1 else 0)
                 val tailHeight = list.layoutInfo.visibleItemsInfo.lastOrNull { it.key == tail.id }?.size
-                Triple(end, tail.entry.value, tailHeight)
+                Triple(end.coerceAtMost(lastIndex), tail.entry.value, tailHeight)
             }
         }.collect { change ->
             if (change != null && follow && !list.isScrollInProgress) {
-                // Clamp like the tail effect: an item's animated height can make the count read stale.
-                list.scrollToItem(change.first.coerceAtMost(list.layoutInfo.totalItemsCount - 1).coerceAtLeast(0))
+                list.scrollToItem(change.first)
             }
         }
     }
@@ -265,16 +278,16 @@ private fun Conversation(
             // jump computed from a half-grown item parks the list past its own content, which paints
             // rows outside the pane. scrollToItem clamps on measure where requestScrollToItem does not.
             if (follow && !list.isScrollInProgress && list.canScrollForward && entries.isNotEmpty()) {
-                val end = entries.size + (if (active) 1 else 0) + (if (ready) 0 else 1)
-                list.scrollToItem(end.coerceAtMost(list.layoutInfo.totalItemsCount - 1).coerceAtLeast(0))
+                val lastIndex = list.layoutInfo.totalItemsCount - 1
+                val end = entries.size + (if (active) 1 else 0)
+                if (lastIndex >= 0) list.scrollToItem(end.coerceAtMost(lastIndex))
             }
         }
     }
-    Box(modifier.fillMaxWidth().clipToBounds()) {
+    Box(pane) {
         LazyColumn(Modifier.fillMaxSize(), state = list,
             contentPadding = PaddingValues(start = 18.dp, end = 18.dp, top = 8.dp, bottom = 16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            if (!loaded) item { Text("Loading…", color = inks.faint, style = MaterialTheme.typography.bodyMedium) }
             items(entries, key = { it.id }) { row ->
                 when (val entry = row.entry.value) {
                     is ThreadItem.User -> UserTurn(entry)
