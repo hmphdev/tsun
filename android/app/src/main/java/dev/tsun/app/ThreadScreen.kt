@@ -262,6 +262,7 @@ private fun toolGlyph(name: String) = when (name) {
     "read_file" -> Glyph.Eye
     "search" -> Glyph.Search
     "list_files" -> Glyph.Folder
+    "delegate_task" -> Glyph.Branch
     else -> Glyph.File
 }
 
@@ -334,6 +335,7 @@ private fun ToolDetail(entry: ThreadItem.Tool) {
     Column(Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, bottom = 12.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp)) {
         when {
+            entry.name == "delegate_task" && entry.output != null -> MarkdownText(entry.output)
             entry.name == "edit_file" && entry.after != null -> EditPreview(entry.before.orEmpty(), entry.after)
             entry.name == "write_file" && entry.after != null ->
                 if (entry.created) EditPreview("", entry.after) else EditPreview(entry.before.orEmpty(), entry.after)
