@@ -57,6 +57,7 @@ import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
@@ -244,20 +245,26 @@ private fun Conversation(
                 Triple(end, tail.entry.value, tailHeight)
             }
         }.collect { change ->
-            if (change != null && follow && !list.isScrollInProgress) list.requestScrollToItem(change.first)
+            if (change != null && follow && !list.isScrollInProgress) {
+                // Clamp like the tail effect: an item's animated height can make the count read stale.
+                list.scrollToItem(change.first.coerceAtMost(list.layoutInfo.totalItemsCount - 1).coerceAtLeast(0))
+            }
         }
     }
     LaunchedEffect(list, entries) {
         // Let the keyboard resize the pane without scheduling a scroll on every animation frame.
         snapshotFlow { list.layoutInfo.viewportSize.height }.collectLatest {
             delay(100)
-            if (follow && entries.isNotEmpty() && list.canScrollForward && !list.isScrollInProgress) {
+            // Re-read the state after the delay: entries animate their height while streaming, and a
+            // jump computed from a half-grown item parks the list past its own content, which paints
+            // rows outside the pane. scrollToItem clamps on measure where requestScrollToItem does not.
+            if (follow && !list.isScrollInProgress && list.canScrollForward && entries.isNotEmpty()) {
                 val end = entries.size + (if (active) 1 else 0) + (if (ready) 0 else 1)
-                list.requestScrollToItem(end)
+                list.scrollToItem(end.coerceAtMost(list.layoutInfo.totalItemsCount - 1).coerceAtLeast(0))
             }
         }
     }
-    Box(modifier.fillMaxWidth()) {
+    Box(modifier.fillMaxWidth().clipToBounds()) {
         LazyColumn(Modifier.fillMaxSize(), state = list,
             contentPadding = PaddingValues(start = 18.dp, end = 18.dp, top = 8.dp, bottom = 16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)) {
