@@ -1,3 +1,4 @@
+#include "agent.hpp"
 #include "jobs.hpp"
 #include "workspaces.hpp"
 
@@ -81,7 +82,7 @@ std::string query(const Request& request, const char* key) {
 }
 
 // Keep a task's directory handle alive for the whole request, even if its run
-// falls out of history. An unknown task must never open the project checkout.
+// falls out of history. An unknown task or thread must never open the project checkout.
 struct FileScope {
     const tsun::Workspace& workspace;
     std::shared_ptr<const tsun::FileRoot> task;
@@ -118,6 +119,15 @@ void download(Response& response, tsun::Download file) {
         });
 }
 
+std::uint64_t number_query(const Request& request, const char* key, std::uint64_t fallback) {
+    const auto value = find_query(request, key);
+    if (!value) return fallback;
+    if (value->empty() || value->size() > 19 || !std::all_of(value->begin(), value->end(), [](unsigned char c) {
+        return c >= '0' && c <= '9';
+    })) throw Error(400, std::string("Expected a number: ") + key);
+    return std::stoull(*value);
+}
+
 int serve(const tsun::Configuration& config, httplib::SSLServer& server) {
     struct sigaction ignore{};
     ignore.sa_handler = SIG_IGN;
@@ -132,12 +142,17 @@ int serve(const tsun::Configuration& config, httplib::SSLServer& server) {
     }
 
     tsun::Jobs jobs(config.state_path);
+    tsun::Agents agents(config.state_path, tsun::load_providers(config.raw, config.state_path));
     const auto scope = [&](const Request& request) -> FileScope {
         const auto& workspace = config.workspace(query(request, "workspace"));
         const auto run = find_query(request, "run");
+        const auto thread = find_query(request, "thread");
+        if (run && thread) throw Error(400, "Use run or thread, not both");
+        if (thread) return {workspace, agents.files(workspace, *thread)};
         return {workspace, run ? jobs.files(workspace, *run) : nullptr};
     };
-    server.new_task_queue = [] { return new httplib::ThreadPool(4, 4, 16); };
+    // Thread reads long-poll for up to two seconds, so keep spare workers.
+    server.new_task_queue = [] { return new httplib::ThreadPool(8, 8, 32); };
     server.set_payload_max_length(tsun::text_limit);
     server.set_keep_alive_max_count(1);
     server.set_read_timeout(5);
@@ -177,7 +192,11 @@ int serve(const tsun::Configuration& config, httplib::SSLServer& server) {
         if (response.body.empty()) problem(response, response.status, httplib::status_message(response.status));
     });
 
-    server.Get("/v1/workspaces", [&](const Request&, Response& res) { respond(res, config.catalog()); });
+    server.Get("/v1/workspaces", [&](const Request&, Response& res) {
+        auto catalog = config.catalog();
+        catalog["agent"] = agents.providers().catalog();
+        respond(res, catalog);
+    });
     server.Get("/v1/entries", [&](const Request& req, Response& res) {
         respond(res, tsun::list_directory(scope(req).root(), find_query(req, "path").value_or("")));
     });
@@ -211,6 +230,32 @@ int serve(const tsun::Configuration& config, httplib::SSLServer& server) {
         respond(res, jobs.stop(req.matches[1].str()));
     });
 
+    constexpr auto thread_route = R"(/v1/threads/([a-f0-9]{24}))";
+    server.Get("/v1/threads", [&](const Request&, Response& res) { respond(res, agents.list()); });
+    server.Post("/v1/threads", [&](const Request& req, Response& res) {
+        const auto body = object_body(req);
+        respond(res, agents.create(config.workspace(string_field(body, "workspace")), body), 201);
+    });
+    server.Get(thread_route, [&](const Request& req, Response& res) {
+        const auto wait = std::min<std::uint64_t>(number_query(req, "wait", 0), 2000);
+        respond(res, agents.read(req.matches[1].str(), number_query(req, "since", 0), std::chrono::milliseconds(wait)));
+    });
+    server.Patch(thread_route, [&](const Request& req, Response& res) {
+        respond(res, agents.update(req.matches[1].str(), object_body(req)));
+    });
+    server.Post(std::string(thread_route) + "/messages", [&](const Request& req, Response& res) {
+        respond(res, agents.send(req.matches[1].str(), object_body(req)), 202);
+    });
+    server.Post(std::string(thread_route) + "/interrupt", [&](const Request& req, Response& res) {
+        respond(res, agents.interrupt(req.matches[1].str()));
+    });
+    server.Post(std::string(thread_route) + "/approval", [&](const Request& req, Response& res) {
+        respond(res, agents.decide(req.matches[1].str(), object_body(req)));
+    });
+    server.Get(std::string(thread_route) + "/diff", [&](const Request& req, Response& res) {
+        respond(res, agents.diff(req.matches[1].str()));
+    });
+
     server.set_start_handler([&] { std::cout << "Tsun listening on https://" << expected_host << std::endl; });
     std::jthread shutdown([&](std::stop_token stop) {
         while (!stop.stop_requested()) {
@@ -229,7 +274,7 @@ int serve(const tsun::Configuration& config, httplib::SSLServer& server) {
 
 int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--version") {
-        std::cout << "Tsun daemon 0.2.0 (protocol 2)\n";
+        std::cout << "Tsun daemon 0.3.0 (protocol 3)\n";
         return 0;
     }
     const bool print_code = argc == 3 && std::string_view(argv[1]) == "--pairing-code";

@@ -182,7 +182,7 @@ Json Configuration::catalog() const {
         result.push_back({{"id", workspace.id}, {"label", workspace.label}, {"worktrees", workspace.worktrees},
             {"commands", std::move(commands)}});
     }
-    return {{"workspaces", std::move(result)}, {"protocol", 2}};
+    return {{"workspaces", std::move(result)}, {"protocol", 3}};
 }
 
 Configuration load_config(const char* state_path) {
@@ -208,7 +208,7 @@ Configuration load_config(const char* state_path) {
     const auto& entries = config.at("workspaces");
     if (!entries.is_array() || entries.empty() || entries.size() > 32) throw std::runtime_error("Configure 1–32 workspaces");
     Configuration result{port.get<int>(), {}, std::move(token), read_state(state, "cert.pem", 16 * 1024, false),
-        read_state(state, "key.pem", 16 * 1024), state_root.string()};
+        read_state(state, "key.pem", 16 * 1024), state_root.string(), config};
     std::set<std::string> workspace_ids;
     for (const auto& entry : entries) {
         auto id = id_field(entry);
