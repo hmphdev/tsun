@@ -28,6 +28,7 @@ public:
     Json create(const Workspace& workspace, const Json& body);
     Json list() const;
     Json read(std::string_view id, std::uint64_t since, std::chrono::milliseconds wait) const;
+    void remove(std::string_view id);
     Json send(std::string_view id, const Json& body);
     Json update(std::string_view id, const Json& body);
     Json interrupt(std::string_view id);
@@ -42,6 +43,7 @@ private:
     struct BackgroundCommand;
 
     std::shared_ptr<Thread> find(std::string_view id) const;
+    void remove_idle(std::shared_ptr<Thread> thread);
     bool effort_command(Thread& thread, const std::string& text);
     bool compact_command(const std::shared_ptr<Thread>& thread, const std::string& text);
     void start_compaction(const std::shared_ptr<Thread>& thread, std::string instructions);
