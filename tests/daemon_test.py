@@ -71,6 +71,10 @@ def openai_stream(content=None, reasoning=None, calls=(), finish="stop"):
     return "".join(f"data: {json.dumps(c)}\n\n" for c in chunks).encode() + b"data: [DONE]\n\n"
 
 
+SEARCH_KEY_VARIABLES = ("BRAVE_SEARCH_API_KEY", "BRAVE_SEARCH_API_KEYS", "TAVILY_API_KEY", "TAVILY_API_KEYS",
+                        "FIRECRAWL_API_KEY", "FIRECRAWL_API_KEYS")
+
+
 class MockProvider:
     """A scripted model API: each request pops the next canned stream."""
 
@@ -213,11 +217,13 @@ class DaemonTest(unittest.TestCase):
         self.start_daemon()
         self.addCleanup(self.shutdown)
 
-    def start_daemon(self):
+    def start_daemon(self, extra_env=None):
+        # Search keys from the host are dropped, so a developer's own keys never reach a test.
+        env = {k: v for k, v in os.environ.items() if k not in SEARCH_KEY_VARIABLES}
+        env.update(extra_env or {})
         self.process = subprocess.Popen(
             [str(DAEMON), str(self.state)], stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True, encoding="utf-8",
-            env={k: v for k, v in os.environ.items() if k != "BRAVE_SEARCH_API_KEY"},
+            stderr=subprocess.PIPE, text=True, encoding="utf-8", env=env,
         )
         with selectors.DefaultSelector() as selector:
             selector.register(self.process.stdout, selectors.EVENT_READ)
@@ -1133,7 +1139,22 @@ class DaemonTest(unittest.TestCase):
         self.assertEqual([e["status"] for e in tools], ["error", "error", "error"])
         self.assertIn("Private and reserved", tools[0]["output"])
         self.assertIn("public HTTP or HTTPS", tools[1]["output"])
-        self.assertIn("BRAVE_SEARCH_API_KEY", tools[2]["output"])
+        self.assertIn("BRAVE_SEARCH_API_KEY, TAVILY_API_KEY or FIRECRAWL_API_KEY", tools[2]["output"])
+
+    def test_web_search_rejects_a_malformed_key_and_skips_unset_providers(self):
+        # The key has a space, so it is refused before any request leaves the daemon. Tavily is
+        # set but empty, so only Brave is reported.
+        self.shutdown()
+        self.start_daemon({"BRAVE_SEARCH_API_KEY": "not a key", "TAVILY_API_KEY": " , "})
+        calls = [("search", "web_search", {"query": "example documentation"})]
+        self.model.script += [openai_stream(calls=calls, finish="tool_calls"), openai_stream(content="Done.")]
+        thread_id = self.post("/v1/threads", {"workspace": "demo", "provider": "local", "mode": "full",
+                               "prompt": "Use the web tools"}, 201)["id"]
+        _, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle")
+        output = next(e for e in items if e.get("name") == "web_search")["output"]
+        self.assertIn("Brave: BRAVE_SEARCH_API_KEY contains invalid characters", output)
+        self.assertNotIn("Tavily", output)
+        self.assertNotIn("Firecrawl", output)
 
     def test_agent_interrupts_a_silent_model(self):
         self.model.script.append(self.model.hang)

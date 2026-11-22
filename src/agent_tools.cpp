@@ -84,7 +84,7 @@ std::vector<ToolSpec> build_tools() {
                 {"session_id", "message"})},
         {"web_fetch", "Read text from a public HTTP(S) page. Redirects, private addresses and binary downloads are not supported.",
             schema({{"url", {{"type", "string"}, {"description", "Public page URL"}}}}, {"url"})},
-        {"web_search", "Search the public web for sources and return titles, URLs and excerpts. Requires a configured Brave API key. Do not put secrets in queries.",
+        {"web_search", "Search the public web for sources and return titles, URLs and excerpts. Requires a configured Brave, Tavily or Firecrawl API key. Do not put secrets in queries.",
             schema({{"query", {{"type", "string"}, {"description", "Search query (up to 400 bytes)"}}}}, {"query"})},
     };
 }
@@ -433,8 +433,9 @@ ToolOutcome list_files(const ToolContext& context, const Json& input) {
 }
 
 std::vector<char*> agent_environment(std::vector<std::string>& storage) {
-    static const std::array<std::string_view, 7> overrides{"TERM=", "PAGER=", "GIT_PAGER=", "GIT_TERMINAL_PROMPT=",
-        "CI=", "NO_COLOR=", "BRAVE_SEARCH_API_KEY="};
+    static const std::array<std::string_view, 12> overrides{"TERM=", "PAGER=", "GIT_PAGER=", "GIT_TERMINAL_PROMPT=",
+        "CI=", "NO_COLOR=", "BRAVE_SEARCH_API_KEY=", "BRAVE_SEARCH_API_KEYS=", "TAVILY_API_KEY=", "TAVILY_API_KEYS=",
+        "FIRECRAWL_API_KEY=", "FIRECRAWL_API_KEYS="};
     for (char** entry = environ; entry && *entry; ++entry) {
         const std::string_view value(*entry);
         if (std::none_of(overrides.begin(), overrides.end(), [&](auto prefix) { return value.starts_with(prefix); })) {
