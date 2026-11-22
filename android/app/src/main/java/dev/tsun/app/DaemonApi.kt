@@ -95,12 +95,14 @@ internal data class AgentThread(
     val id: String, val workspace: String, val title: String, val state: String, val mode: Mode,
     val provider: String, val providerLabel: String, val model: String, val branch: String?, val filesReady: Boolean,
     val runs: Int, val pendingCall: String?, val additions: Int, val deletions: Int, val filesChanged: Int,
-    val error: String?, val canSteer: Boolean,
+    val copiedFiles: Int, val error: String?, val canSteer: Boolean,
 ) {
     val active get() = state != "idle"
 }
 internal data class ThreadList(val items: List<AgentThread>, val capacity: Int)
-internal data class FileStat(val path: String, val additions: Int, val deletions: Int, val binary: Boolean)
+internal data class FileStat(
+    val path: String, val additions: Int, val deletions: Int, val binary: Boolean, val copied: Boolean = false,
+)
 
 internal sealed interface ThreadItem {
     val id: String
@@ -119,11 +121,14 @@ internal sealed interface ThreadItem {
     data class Note(override val id: String, override val run: Int, val text: String, val error: Boolean) : ThreadItem
     data class RunEnd(
         override val id: String, override val run: Int, val durationMs: Long, val additions: Int, val deletions: Int,
-        val files: List<FileStat>, val stopped: Boolean,
+        val copiedFiles: Int, val copiedLines: Int, val files: List<FileStat>, val stopped: Boolean,
     ) : ThreadItem
 }
 internal data class ThreadPage(val thread: AgentThread, val rev: Long, val reset: Boolean, val items: List<ThreadItem>)
-internal data class Review(val diff: String, val truncated: Boolean, val files: List<FileStat>, val additions: Int, val deletions: Int)
+internal data class Review(
+    val diff: String, val truncated: Boolean, val files: List<FileStat>, val additions: Int, val deletions: Int,
+    val copiedFiles: Int, val copiedLines: Int,
+)
 
 internal class ApiError(val status: Int, message: String) : IOException(message)
 
@@ -207,7 +212,8 @@ internal class DaemonApi(private val pairing: Pairing) {
         val response = json("/v1/threads/${encode(id)}/diff", timeout = 30_000)
         return Review(response.getString("diff"), response.optBoolean("truncated"),
             response.getJSONArray("files").mapObjects { it.fileStat() },
-            response.optInt("additions"), response.optInt("deletions"))
+            response.optInt("additions"), response.optInt("deletions"),
+            response.optInt("copiedFiles"), response.optInt("copiedLines"))
     }
 
     private suspend fun post(path: String, body: JSONObject): JSONObject =
@@ -333,11 +339,13 @@ private fun JSONObject.thread(): AgentThread = AgentThread(
     mode = Mode.of(getString("mode")), provider = getString("provider"), providerLabel = getString("providerLabel"),
     model = getString("model"), branch = optStringOrNull("branch"), filesReady = getBoolean("filesReady"),
     runs = getInt("runs"), pendingCall = optStringOrNull("pendingCall"), additions = getInt("additions"),
-    deletions = getInt("deletions"), filesChanged = getInt("filesChanged"), error = optStringOrNull("error"),
-    canSteer = optBoolean("canSteer"),
+    deletions = getInt("deletions"), filesChanged = getInt("filesChanged"), copiedFiles = optInt("copiedFiles"),
+    error = optStringOrNull("error"), canSteer = optBoolean("canSteer"),
 )
 
-private fun JSONObject.fileStat() = FileStat(getString("path"), getInt("additions"), getInt("deletions"), optBoolean("binary"))
+private fun JSONObject.fileStat() = FileStat(
+    getString("path"), getInt("additions"), getInt("deletions"), optBoolean("binary"), optBoolean("copied"),
+)
 
 private fun JSONObject.threadItem(): ThreadItem? {
     val id = getString("id")
@@ -351,6 +359,7 @@ private fun JSONObject.threadItem(): ThreadItem? {
             optStringOrNull("before"), optStringOrNull("after"), optBoolean("created"))
         "notice" -> ThreadItem.Note(id, run, getString("text"), optString("tone") == "error")
         "run" -> ThreadItem.RunEnd(id, run, optLong("duration"), optInt("additions"), optInt("deletions"),
+            optInt("copiedFiles"), optInt("copiedLines"),
             optJSONArray("files")?.mapObjects { it.fileStat() }.orEmpty(), optBoolean("stopped"))
         else -> null // Newer daemons may add kinds; skip what this app doesn't know.
     }

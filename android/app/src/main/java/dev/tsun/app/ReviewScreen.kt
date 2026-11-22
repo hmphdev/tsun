@@ -84,7 +84,10 @@ internal fun ReviewScreen(api: DaemonApi, thread: AgentThread, handlesBack: Bool
                 Text("Changes", style = MaterialTheme.typography.headlineSmall, color = inks.ink)
                 Text(thread.branch.orEmpty(), style = SmallCode, color = inks.faint, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
-            if (current != null) DiffStat(current.additions, current.deletions, Modifier.padding(end = 4.dp))
+            if (current != null && current.additions + current.deletions > 0) {
+                DiffStat(current.additions, current.deletions, Modifier.padding(end = 4.dp))
+            }
+            if (current != null && current.copiedFiles > 0) CopiedNote(current.copiedFiles, Modifier.padding(end = 4.dp))
             GlyphButton(Glyph.Refresh, "Refresh the diff") { reload++ }
         }
         error?.let { Notice(it, Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp), error = true) }
@@ -104,7 +107,10 @@ internal fun ReviewScreen(api: DaemonApi, thread: AgentThread, handlesBack: Bool
                                 LineIcon(Glyph.File, size = 15, color = inks.faint)
                                 Text(file.path, Modifier.weight(1f), style = SmallCode, color = inks.ink, maxLines = 1,
                                     overflow = TextOverflow.Ellipsis)
-                                if (file.binary) Text("binary", style = SmallCode, color = inks.faint)
+                                if (file.copied) Text(
+                                    "copied · ${file.additions} ${if (file.additions == 1) "line" else "lines"}",
+                                    style = SmallCode, color = inks.faint)
+                                else if (file.binary) Text("binary", style = SmallCode, color = inks.faint)
                                 else DiffStat(file.additions, file.deletions)
                             }
                         }

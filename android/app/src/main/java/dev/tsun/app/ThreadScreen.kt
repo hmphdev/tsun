@@ -219,7 +219,8 @@ private fun ThreadChips(thread: AgentThread, onReview: () -> Unit, onFiles: () -
                 else {
                     Text("${thread.filesChanged} ${if (thread.filesChanged == 1) "file" else "files"}",
                         style = MaterialTheme.typography.labelMedium, color = inks.quiet)
-                    DiffStat(thread.additions, thread.deletions)
+                    if (thread.additions + thread.deletions > 0) DiffStat(thread.additions, thread.deletions)
+                    if (thread.copiedFiles > 0) CopiedNote(thread.copiedFiles)
                 }
             }
         }
@@ -494,7 +495,7 @@ internal fun DiffLine(sign: String, text: String, color: Color) {
 
 @Composable
 private fun RunSummary(entry: ThreadItem.RunEnd, onReview: () -> Unit) {
-    val changed = entry.additions + entry.deletions > 0
+    val changed = entry.additions + entry.deletions > 0 || entry.copiedFiles > 0
     Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).clickable(enabled = changed, role = Role.Button, onClick = onReview)
         .padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -502,7 +503,8 @@ private fun RunSummary(entry: ThreadItem.RunEnd, onReview: () -> Unit) {
         Text((if (entry.stopped) "Stopped after " else "Worked ") + duration(entry.durationMs) +
             if (changed) " · ${entry.files.size} ${if (entry.files.size == 1) "file" else "files"}" else "",
             style = MaterialTheme.typography.bodySmall, color = inks.faint)
-        if (changed) DiffStat(entry.additions, entry.deletions)
+        if (entry.additions + entry.deletions > 0) DiffStat(entry.additions, entry.deletions)
+        if (entry.copiedFiles > 0) CopiedNote(entry.copiedFiles)
         Box(Modifier.weight(1f).height(1.dp).background(inks.rule))
     }
 }
@@ -643,6 +645,7 @@ internal fun ThreadRow(thread: AgentThread, selected: Boolean, onClick: () -> Un
                 maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
         if (thread.additions + thread.deletions > 0) DiffStat(thread.additions, thread.deletions)
+        if (thread.copiedFiles > 0) CopiedNote(thread.copiedFiles)
     }
 }
 
