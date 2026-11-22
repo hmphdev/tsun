@@ -9,6 +9,8 @@
 #include <array>
 #include <cerrno>
 #include <cstring>
+#include <fcntl.h>
+#include <unistd.h>
 
 extern char** environ;
 
@@ -19,6 +21,19 @@ using Clock = std::chrono::steady_clock;
 
 void check(int error, const char* what) {
     if (error != 0) throw Error(500, std::string(what) + ": " + std::strerror(error));
+}
+
+// stdin must read as EOF. Normally that is /dev/null, but the chroot's /dev can
+// vanish under memory pressure, so fall back to an empty pipe instead of
+// failing every spawn with ENOENT.
+Fd open_stdin() {
+    if (const int fd = ::open("/dev/null", O_RDONLY | O_CLOEXEC); fd >= 0) return Fd(fd);
+    int pipe_fds[2];
+    if (::pipe2(pipe_fds, O_CLOEXEC) == 0) {
+        ::close(pipe_fds[1]); // With no write end, reads on the read end return EOF.
+        return Fd(pipe_fds[0]);
+    }
+    return Fd();
 }
 
 class OutputBuffer {
@@ -83,7 +98,13 @@ ProcessResult run_process(const Fd& cwd, const std::vector<std::string>& argv, c
     } cleanup{&actions, &attrs};
 
     check(::posix_spawn_file_actions_addfchdir_np(&actions, cwd.get()), "Could not start process");
-    check(::posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0), "Could not start process");
+    Fd stdin_eof = open_stdin();
+    if (stdin_eof) {
+        check(::posix_spawn_file_actions_adddup2(&actions, stdin_eof.get(), STDIN_FILENO), "Could not start process");
+    } else {
+        check(::posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0),
+              "Could not start process");
+    }
     check(::posix_spawn_file_actions_adddup2(&actions, writer.get(), STDOUT_FILENO), "Could not start process");
     check(::posix_spawn_file_actions_adddup2(&actions, writer.get(), STDERR_FILENO), "Could not start process");
     check(::posix_spawn_file_actions_addclosefrom_np(&actions, 3), "Could not start process");

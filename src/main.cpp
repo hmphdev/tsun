@@ -7,10 +7,14 @@
 #include <openssl/ssl.h>
 #include <pthread.h>
 #include <signal.h>
+#include <sys/mount.h>
+#include <sys/stat.h>
+#include <sys/vfs.h>
 
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cstring>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -23,6 +27,31 @@ using httplib::Request;
 using httplib::Response;
 using tsun::Error;
 using tsun::Json;
+
+// The App can start this chroot in a mount namespace where /proc and /dev were
+// torn down (or never mounted). Reads reopen files through /proc/self/fd
+// (workspaces.cpp) and every spawn needs /dev/null, so put both pseudo
+// filesystems back. A daemon without the privilege to mount keeps running and
+// reports it once instead.
+void ensure_runtime_mounts() {
+    constexpr long proc_super_magic = 0x9fa0;
+    struct statfs proc_info{};
+    if (::statfs("/proc", &proc_info) != 0 || proc_info.f_type != proc_super_magic) {
+        if (::mkdir("/proc", 0555) < 0 && errno != EEXIST) {
+            std::cerr << "Tsun: could not create /proc: " << std::strerror(errno) << '\n';
+        } else if (::mount("proc", "/proc", "proc", 0, nullptr) != 0) {
+            std::cerr << "Tsun: could not mount /proc: " << std::strerror(errno) << '\n';
+        }
+    }
+    // No CAP_MKNOD in the Android root setup, so restore the device nodes with
+    // devtmpfs instead of creating /dev/null by hand.
+    struct stat null_info{};
+    if (::lstat("/dev/null", &null_info) != 0 || !S_ISCHR(null_info.st_mode)) {
+        if (::mount("devtmpfs", "/dev", "devtmpfs", MS_NOSUID | MS_NOEXEC, nullptr) != 0) {
+            std::cerr << "Tsun: could not mount devtmpfs on /dev: " << std::strerror(errno) << '\n';
+        }
+    }
+}
 
 void respond(Response& response, const Json& body, int status = 200) {
     response.status = status;
@@ -298,6 +327,7 @@ int main(int argc, char** argv) {
     }
     try {
         const auto config = tsun::load_config(argv[print_code ? 2 : 1]);
+        ensure_runtime_mounts();
         httplib::SSLServer server(httplib::SSLServer::PemMemory{
             config.certificate.data(), config.certificate.size(), config.private_key.data(), config.private_key.size(),
             nullptr, 0, nullptr,
