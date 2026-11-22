@@ -1030,6 +1030,26 @@ class DaemonTest(unittest.TestCase):
         checkpoint = next(e["checkpoint"] for e in items if e["kind"] == "run" and e["run"] == 2)
         self.assertEqual(self.git(root, "show", f"{checkpoint}:generated.txt"), "generated")
 
+    def test_bash_content_is_capped_for_the_model(self):
+        self.model.script += [
+            anthropic_stream([{"type": "tool_use", "id": "toolu_noise", "name": "bash",
+                               "input": {"command": "python3 -c \"import sys; sys.stdout.write('a'*200000 + 'THE-END')\""}}],
+                             "tool_use"),
+            anthropic_stream([{"type": "text", "text": "Done."}], "end_turn"),
+        ]
+        thread_id = self.post("/v1/threads", {"workspace": "isolated", "prompt": "Make noise.",
+                                              "mode": "full"}, 201)["id"]
+        thread, _ = self.thread_until(thread_id, lambda t, _: t["state"] == "idle")
+        self.assertIsNone(thread["error"])
+        replay = self.model.requests[-1]["body"]["messages"]
+        results = [block for message in replay if message["role"] == "user"
+                   for block in message["content"] if block.get("type") == "tool_result"]
+        self.assertEqual(len(results), 1)
+        text = results[0]["content"]
+        self.assertLessEqual(len(text.encode()), 51 * 1024)
+        self.assertIn("bytes of output omitted", text)
+        self.assertTrue(text.rstrip().endswith("THE-END"))
+
     def test_stop_and_shutdown_cancel_background_bash_while_idle(self):
         for shutdown in (False, True):
             with self.subTest(shutdown=shutdown):

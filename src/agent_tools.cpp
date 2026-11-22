@@ -271,6 +271,15 @@ std::string clip(std::string text, std::size_t limit) {
     return text + "…";
 }
 
+// Keep the end of the output, where errors and final results usually are, and
+// cap what enters the history: these bytes are replayed on every later step.
+std::string tail_clip(std::string text, std::size_t limit) {
+    if (text.size() <= limit) return text;
+    auto start = text.size() - limit;
+    while (start < text.size() && (static_cast<unsigned char>(text[start]) & 0xC0) == 0x80) ++start; // keep UTF-8 whole
+    return "… [" + std::to_string(start) + " bytes of output omitted] …\n" + text.substr(start);
+}
+
 std::size_t count_lines(const std::string& text) {
     if (text.empty()) return 0;
     return static_cast<std::size_t>(std::count(text.begin(), text.end(), '\n')) + (text.back() == '\n' ? 0 : 1);
@@ -477,7 +486,9 @@ ToolOutcome bash(const ToolContext& context, const Json& input) {
         : result.timed_out ? "Timed out after " + std::to_string(seconds) + (seconds == 1 ? " second." : " seconds.")
         : "Exit code " + std::to_string(result.exit_code);
     const auto body = result.output.empty() ? std::string("(no output)") : result.output;
-    return {header + "\n" + body, result.exit_code != 0 || result.timed_out || result.cancelled,
+    // The model gets the tail, bounded like Pi's bash tool; the UI keeps the head.
+    constexpr std::size_t model_output_limit = 50 * 1024;
+    return {header + "\n" + tail_clip(body, model_output_limit), result.exit_code != 0 || result.timed_out || result.cancelled,
         {{"exitCode", result.exit_code}, {"timedOut", result.timed_out}, {"output", clip(body, 24 * 1024)}}};
 }
 
