@@ -3,7 +3,6 @@ package dev.tsun.app
 import android.content.ClipData
 import android.content.ClipboardManager
 import androidx.activity.compose.BackHandler
-import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
@@ -302,7 +301,11 @@ private fun Conversation(
             items(entries, key = { it.id }) { row ->
                 when (val entry = row.entry.value) {
                     is ThreadItem.User -> UserTurn(entry)
-                    is ThreadItem.Text -> if (entry.text.isNotBlank()) {
+                    is ThreadItem.Text -> if (entry.text.isBlank()) {
+                        // Keep the row's slot while a text block is still empty, so the list
+                        // below it does not shift on a fast scroll.
+                        Spacer(Modifier.height(1.dp))
+                    } else {
                         SelectionContainer { MarkdownText(entry.text, Modifier.fillMaxWidth()) }
                     }
                     is ThreadItem.Thinking -> ThinkingRow(entry)
@@ -355,7 +358,7 @@ private fun ThinkingRow(entry: ThreadItem.Thinking) {
         else if (entry.text.length <= STREAMING_TEXT_WINDOW) entry.text.trim()
         else "…" + entry.text.takeLast(STREAMING_TEXT_WINDOW).trimStart()
     }
-    Column(Modifier.fillMaxWidth().then(if (entry.streaming) Modifier else Modifier.animateContentSize())) {
+    Column(Modifier.fillMaxWidth()) {
         Row(Modifier.clip(RoundedCornerShape(8.dp)).clickable(enabled = entry.text.isNotBlank(), role = Role.Button) { open = !open }
             .padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -398,7 +401,7 @@ private fun ToolRow(entry: ThreadItem.Tool, waiting: Boolean, onDecide: (String,
     val expandable = entry.output != null || entry.after != null
     val shape = RoundedCornerShape(12.dp)
     Column(Modifier.fillMaxWidth().clip(shape).background(if (waiting) inks.accentWash else inks.sheet.copy(alpha = 0.7f))
-        .border(1.dp, if (waiting) inks.accent.copy(alpha = 0.55f) else inks.rule, shape).animateContentSize()) {
+        .border(1.dp, if (waiting) inks.accent.copy(alpha = 0.55f) else inks.rule, shape)) {
         Row(Modifier.fillMaxWidth().clickable(enabled = expandable, role = Role.Button) { open = !open }
             .heightIn(min = 42.dp).padding(horizontal = 12.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(9.dp)) {
