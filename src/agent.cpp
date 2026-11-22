@@ -1130,7 +1130,8 @@ bool Agents::run_steps(Thread& thread) {
                 set_status("error");
             } else {
                 const auto risk = tool_risk(call.name);
-                const bool ask = risk == ToolRisk::Peer || (thread.mode == "ask" && risk != ToolRisk::Read) ||
+                const bool ask = (thread.mode != "full" && risk == ToolRisk::Peer) ||
+                    (thread.mode == "ask" && risk != ToolRisk::Read) ||
                     (thread.mode == "edits" && risk == ToolRisk::Command);
                 if (risk == ToolRisk::Peer) --remaining_messages;
                 bool allowed = true;
