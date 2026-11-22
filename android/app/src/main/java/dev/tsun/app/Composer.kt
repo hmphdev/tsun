@@ -62,6 +62,7 @@ internal fun Composer(
     onStop: () -> Unit,
     modifier: Modifier = Modifier,
     canSteer: Boolean = false,
+    canStop: Boolean = working,
     leading: @Composable RowScope.() -> Unit = {},
 ) {
     Surface(modifier.fillMaxWidth(), shape = RoundedCornerShape(22.dp), color = inks.raised,
@@ -95,9 +96,10 @@ internal fun Composer(
                     if (providers.isNotEmpty()) ModelPicker(providers, provider, onProvider, enabled = !working)
                 }
                 Spacer(Modifier.width(8.dp))
-                if (working) RoundAction(Glyph.Stop, "Stop the agent", enabled = !busy, filled = false, onClick = onStop)
+                if (canStop) RoundAction(Glyph.Stop, if (working) "Stop the agent" else "Stop background work",
+                    enabled = !busy, filled = false, onClick = onStop)
                 if (!working || canSteer) {
-                    if (working) Spacer(Modifier.width(6.dp))
+                    if (canStop) Spacer(Modifier.width(6.dp))
                     RoundAction(Glyph.Up, if (working) "Steer the agent" else "Send",
                         enabled = canSend && !busy && hasText, filled = true) {
                         onSend(draft.text.toString().trim())

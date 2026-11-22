@@ -39,6 +39,7 @@ private:
     using Clock = std::chrono::system_clock;
     struct Thread;
     struct PeerRequest;
+    struct BackgroundCommand;
 
     std::shared_ptr<Thread> find(std::string_view id) const;
     bool effort_command(Thread& thread, const std::string& text);
@@ -46,7 +47,12 @@ private:
     void start_compaction(const std::shared_ptr<Thread>& thread, std::string instructions);
     void work_compaction(const std::shared_ptr<Thread>& thread);
     void begin_run(Thread& thread);
-    void start_run(const std::shared_ptr<Thread>& thread, std::string prompt, std::shared_ptr<PeerRequest> peer = {});
+    void start_run(const std::shared_ptr<Thread>& thread, std::optional<std::string> prompt,
+                   std::shared_ptr<PeerRequest> peer = {});
+    ToolOutcome start_background(Thread& thread, const std::string& item_id, const ToolCall& call);
+    void finish_background(BackgroundCommand& job, const ToolOutcome& outcome);
+    void dispatch_background();
+    void deliver_background(Thread& thread);
     ToolOutcome message_session(Thread& source, const ToolCall& call);
     void work(std::shared_ptr<Thread> thread);
     bool run_steps(Thread& thread);
@@ -60,7 +66,7 @@ private:
     Json* item(Thread& thread, const std::string& id);
     Json document(const Thread& thread) const;
     std::shared_ptr<Thread> restore(const std::string& path) const;
-    void save_thread(const Json& document) const;
+    void save_thread(Thread& thread, const Json& document) const;
     void save_changed(bool everything);
     void load_threads();
     void save_loop();
@@ -71,6 +77,7 @@ private:
     mutable std::mutex mutex_;
     mutable std::condition_variable changed_;
     std::list<std::shared_ptr<Thread>> threads_;
+    std::list<BackgroundCommand> background_;
     std::thread saver_;
     std::atomic<bool> stop_saver_{false};
     bool shutting_down_ = false;

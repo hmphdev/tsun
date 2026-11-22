@@ -32,11 +32,13 @@ Json schema(Json properties, std::vector<std::string> required) {
 std::vector<ToolSpec> build_tools() {
     return {
         {"bash",
-            "Run a shell command with /bin/bash in the workspace root and return its exit code and combined output. "
-            "Each call starts a fresh non-interactive shell (no stdin, cd and exports do not persist). Use it for "
-            "builds, tests, git inspection, and other programs. Do not start servers or background processes.",
+            "Run a shell command with /bin/bash in the workspace root. Each call starts a fresh non-interactive "
+            "shell (no stdin, cd and exports do not persist). Use it for builds, tests, and git inspection. "
+            "Do not start servers or detach processes yourself.",
             schema({{"command", {{"type", "string"}, {"description", "The command line to run"}}},
-                {"timeout_seconds", {{"type", "integer"}, {"description", "Time limit, 1-600 seconds (default 120)"}}}},
+                {"timeout_seconds", {{"type", "integer"}, {"description", "Time limit, 1-600 seconds (default 120), including in the background"}}},
+                {"background", {{"type", "boolean"}, {"description", "Run as a managed background command and return immediately. "
+                    "Tsun delivers the exit status and output automatically when it ends. Do not poll or use &."}}}},
                 {"command"})},
         {"read_file",
             "Read a file. UTF-8 text comes back with lines numbered from 1; use offset and limit for large files. "
@@ -461,9 +463,11 @@ ToolOutcome bash(const ToolContext& context, const Json& input) {
     options.timeout = std::chrono::seconds(seconds);
     options.cancel = &context.cancel;
     options.env = env.data();
-    const auto result = run_process(context.root.directory, {"/bin/bash", "-c", command}, options);
+    ProcessResult result;
+    if (context.cancel) result.cancelled = true;
+    else result = run_process(context.root.directory, {"/bin/bash", "-c", command}, options);
     std::string header = result.cancelled ? "Interrupted by the user."
-        : result.timed_out ? "Timed out after " + std::to_string(seconds) + " seconds."
+        : result.timed_out ? "Timed out after " + std::to_string(seconds) + (seconds == 1 ? " second." : " seconds.")
         : "Exit code " + std::to_string(result.exit_code);
     const auto body = result.output.empty() ? std::string("(no output)") : result.output;
     return {header + "\n" + body, result.exit_code != 0 || result.timed_out || result.cancelled,
@@ -518,6 +522,12 @@ ToolRisk tool_risk(std::string_view name) {
     return ToolRisk::Read;
 }
 
+bool background_bash(const ToolCall& call) {
+    if (call.name != "bash" || !call.input.is_object()) return false;
+    const auto* value = field(call.input, "background");
+    return value && value->is_boolean() && value->get<bool>();
+}
+
 std::optional<std::string> validate_call(const ToolCall& call, const std::string& root_path) {
     if (!call.invalid_input.empty()) return "The tool input was not valid JSON. Send the call again with a complete JSON object.";
     const auto& tools = agent_tools();
@@ -530,11 +540,17 @@ std::optional<std::string> validate_call(const ToolCall& call, const std::string
     const auto& properties = spec->schema["properties"];
     for (const auto& [key, value] : call.input.items()) {
         if (!properties.contains(key)) return "Unexpected field: " + key;
-        if (value.is_null()) continue;
+            if (value.is_null() && key != "background") continue;
         const auto type = properties[key]["type"].get<std::string>();
         const bool ok = type == "string" ? value.is_string() : type == "integer" ? is_int(&value)
             : type == "boolean" ? value.is_boolean() : true;
         if (!ok) return "Field " + key + " must be a " + type;
+    }
+    if (call.name == "bash") {
+        const auto command = text_field(call.input, "command");
+        if (command.empty() || command.size() > 64 * 1024 || command.find('\0') != command.npos) {
+            return "command must be 1 byte to 64 KiB and cannot contain NUL";
+        }
     }
     if (call.name == "delegate_task") {
         const auto task = text_field(call.input, "task");
@@ -567,7 +583,8 @@ Json describe_call(const ToolCall& call, const std::string& root_path) {
         if (path.rfind(root_path + "/", 0) == 0) return path.substr(root_path.size() + 1);
         return path.empty() ? std::string(".") : path;
     };
-    if (call.name == "bash") return {{"title", "Bash"}, {"detail", clip(text_field(input, "command"), 4000)}};
+    if (call.name == "bash") return {{"title", background_bash(call) ? "Background bash" : "Bash"},
+        {"detail", clip(text_field(input, "command"), 4000)}};
     if (call.name == "read_file") return {{"title", "Read"}, {"detail", relative(text_field(input, "path"))}};
     if (call.name == "write_file") return {{"title", "Write"}, {"detail", relative(text_field(input, "path"))}};
     if (call.name == "edit_file") return {{"title", "Edit"}, {"detail", relative(text_field(input, "path"))}};
