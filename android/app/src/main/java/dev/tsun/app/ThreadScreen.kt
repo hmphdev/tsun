@@ -31,8 +31,10 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.input.TextFieldState
 import androidx.compose.foundation.text.input.clearText
 import androidx.compose.foundation.text.input.rememberTextFieldState
+import androidx.compose.foundation.text.input.setTextAndPlaceCursorAtEnd
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -195,6 +197,10 @@ internal fun ThreadScreen(
             },
             onStop = { act { api.interrupt(threadId) } },
             modifier = Modifier.padding(start = 12.dp, end = 12.dp, top = 6.dp, bottom = 10.dp),
+            leading = {
+                if (current != null) SkillPicker(api, current.workspace, threadId,
+                    enabled = !current.active && current.filesReady && !busy) { draft.useSkill(it) }
+            },
         )
     }
 }
@@ -552,6 +558,7 @@ internal fun duration(ms: Long): String {
 
 @Composable
 internal fun NewSessionScreen(
+    api: DaemonApi,
     workspace: Workspace?,
     workspaces: List<Workspace>,
     providers: List<ModelProvider>,
@@ -605,11 +612,19 @@ internal fun NewSessionScreen(
             onStop = {},
             modifier = Modifier.padding(start = 12.dp, end = 12.dp, top = 6.dp, bottom = 10.dp),
             leading = {
+                if (workspace != null) SkillPicker(api, workspace.id, thread = null,
+                    enabled = online && !busy) { draft.useSkill(it) }
                 ProjectPicker(workspace, workspaces, onWorkspace)
                 if (workspace != null && workspace.presets.isNotEmpty()) PresetPicker(workspace.presets, online && !busy, onPreset)
             },
         )
     }
+}
+
+private fun TextFieldState.useSkill(skill: SkillInfo) {
+    val task = text.toString().trimStart().replaceFirst(Regex("^/skill:[a-z0-9-]+(?:\\s+|$)"), "")
+    val prefix = "/skill:${skill.name} "
+    setTextAndPlaceCursorAtEnd(prefix + task)
 }
 
 @Composable

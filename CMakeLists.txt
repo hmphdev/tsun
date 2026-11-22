@@ -19,20 +19,33 @@ FetchContent_Declare(json
     URL_HASH SHA256=13ef31d691947940a08909f8e0772f1d7d68e5da1678ee812a49c4bb0c996b2f
     TLS_VERIFY TRUE
     SOURCE_SUBDIR headers-only)
+FetchContent_Declare(libyaml
+    URL https://codeload.github.com/yaml/libyaml/tar.gz/refs/tags/0.2.5
+    URL_HASH SHA256=fa240dbf262be053f3898006d502d514936c818e422afdcf33921c63bed9bf2e
+    TLS_VERIFY TRUE)
 FetchContent_MakeAvailable(httplib json)
+# Build the YAML parser, not its standalone test binaries.
+function(load_libyaml)
+    set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.10) # libyaml 0.2.5 predates CMake 4
+    set(BUILD_TESTING OFF)
+    set(BUILD_SHARED_LIBS OFF)
+    FetchContent_MakeAvailable(libyaml)
+endfunction()
+load_libyaml()
 find_package(Threads REQUIRED)
 find_package(OpenSSL 3.0 REQUIRED)
 find_package(LibXml2 REQUIRED)
 
 add_executable(mobile-harness src/main.cpp src/workspaces.cpp src/jobs.cpp src/process.cpp
-    src/provider.cpp src/agent_tools.cpp src/agent.cpp src/web_tools.cpp)
+    src/provider.cpp src/agent_tools.cpp src/agent.cpp src/web_tools.cpp src/skills.cpp)
 target_compile_features(mobile-harness PRIVATE cxx_std_20)
 set_target_properties(mobile-harness PROPERTIES CXX_EXTENSIONS OFF)
 target_compile_options(mobile-harness PRIVATE -Wall -Wextra -Wpedantic)
 target_include_directories(mobile-harness SYSTEM PRIVATE
     "${httplib_SOURCE_DIR}" "${json_SOURCE_DIR}/single_include")
 target_compile_definitions(mobile-harness PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
-target_link_libraries(mobile-harness PRIVATE Threads::Threads OpenSSL::SSL OpenSSL::Crypto LibXml2::LibXml2)
+target_link_libraries(mobile-harness PRIVATE Threads::Threads OpenSSL::SSL OpenSSL::Crypto LibXml2::LibXml2 yaml)
 
 include(CTest)
 if(BUILD_TESTING)

@@ -59,6 +59,9 @@ private class DaemonTrust(fingerprint: String) : X509TrustManager {
 }
 
 internal data class Preset(val id: String, val label: String)
+internal data class SkillInfo(val name: String, val description: String, val path: String, val manual: Boolean)
+internal data class SkillCatalog(val skills: List<SkillInfo>, val warnings: List<String>)
+internal data class SkillDocument(val text: String, val path: String)
 internal data class Workspace(val id: String, val label: String, val worktrees: Boolean, val presets: List<Preset>)
 internal data class FileScope(val workspace: String, val run: String? = null, val thread: String? = null)
 internal data class Entry(val name: String, val directory: Boolean, val size: Long)
@@ -181,6 +184,24 @@ internal class DaemonApi(private val pairing: Pairing) {
                 it.getBoolean("enabled"), it.optStringOrNull("reason"))
         }
         return Catalog(workspaces, providers, agent.optStringOrNull("default"))
+    }
+
+    private fun skillsPath(workspace: String, thread: String?): String =
+        "/v1/skills?workspace=${encode(workspace)}" + (thread?.let { "&thread=${encode(it)}" } ?: "")
+
+    suspend fun skillDocument(workspace: String, thread: String?, name: String): SkillDocument =
+        readJson(skillsPath(workspace, thread) + "&name=${encode(name)}") { response ->
+            SkillDocument(response.getString("text"), response.getString("path"))
+        }
+
+    suspend fun skills(workspace: String, thread: String?): SkillCatalog {
+        return readJson(skillsPath(workspace, thread)) { response ->
+            val entries = response.getJSONArray("skills").mapObjects {
+                SkillInfo(it.getString("name"), it.getString("description"), it.getString("path"), it.getBoolean("manual"))
+            }
+            val warnings = response.getJSONArray("warnings")
+            SkillCatalog(entries, List(warnings.length()) { warnings.getString(it) })
+        }
     }
 
     /** Long-polls for up to [waitMs] when nothing changed since [since]. */

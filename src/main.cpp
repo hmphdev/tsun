@@ -236,6 +236,12 @@ int serve(const tsun::Configuration& config, httplib::SSLServer& server) {
             respond(res, catalog);
         }
     });
+    server.Get("/v1/skills", [&](const Request& req, Response& res) {
+        if (find_query(req, "run")) throw Error(400, "Skills are scoped to a project or agent session");
+        const auto files = scope(req);
+        if (const auto name = find_query(req, "name")) respond(res, agents.skill_file(files.root(), *name));
+        else respond(res, agents.skills(files.root()));
+    });
     server.Get("/v1/entries", [&](const Request& req, Response& res) {
         respond(res, tsun::list_directory(scope(req).root(), find_query(req, "path").value_or("")));
     });

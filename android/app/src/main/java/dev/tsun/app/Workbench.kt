@@ -424,7 +424,7 @@ internal fun Workbench(
                     }
                     else -> screenState.SaveableStateProvider("home") {
                         NewSessionScreen(
-                            workspace, workspaces, providers, catalog?.defaultProvider,
+                            api, workspace, workspaces, providers, catalog?.defaultProvider,
                             recent = remember(threads.items, workspace?.id) { threads.items.filter { it.workspace == workspace?.id }.take(5) },
                             online = online, busy = submitting, error = actionError,
                             mode = mode, onMode = onMode, onWorkspace = { workspaceId = it.id },

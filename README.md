@@ -4,7 +4,7 @@ A native Android workbench for your existing Debian chroot. Start a coding-agent
 
 ## Run the daemon in Debian
 
-You need Linux with glibc 2.34+, a C++20 compiler, CMake 3.22+, OpenSSL 3, Git, and Python 3. On Debian, install any missing packages with `apt install build-essential cmake libssl-dev libxml2-dev ca-certificates openssl git python3`. CMake fetches two pinned header dependencies on the first build. Use the daemon and APK from the same version.
+You need Linux with glibc 2.34+, a C++20 compiler, CMake 3.22+, OpenSSL 3, Git, and Python 3. On Debian, install any missing packages with `apt install build-essential cmake libssl-dev libxml2-dev ca-certificates openssl git python3`. CMake fetches two pinned header dependencies and a pinned YAML parser on the first build. Use the daemon and APK from the same version.
 
 ```sh
 cd /root/mobile-harness
@@ -51,6 +51,7 @@ A session is a conversation with a coding agent about one project. The daemon ru
 - **Tools.** Every provider gets the same JSON-schema tools. Use `read_file`, `write_file`, `edit_file`, `list_files`, and `search` to work with files. `read_file` on a PNG, JPEG, GIF, or WebP image up to 2 MiB returns the image itself, so the agent can look at screenshots and diagrams. Each `bash` call is a fresh non-interactive shell in the worktree with a time limit.
 - **Background commands.** `bash` accepts `background: true` for builds and tests that can run while the agent does other work. Approval is unchanged. The command card shows **In background**, then the final status and bounded output. Tsun delivers the result at the next model request boundary or wakes an idle session to handle it. You can still reply while a command is running; **Stop** cancels the session's background commands too. The existing `timeout_seconds` limit still applies (120 seconds by default); foreground commands still stop at their timeout. Tsun allows up to two pending background commands or results per session and six running commands daemon-wide. Commands are stopped on clean shutdown and are not resumed after a restart. Do not use `&` to detach commands.
 - **Project instructions.** Tsun loads the active workspace root's `AGENTS.md` into the system prompt at the start of each turn and shares that snapshot with subagents. On an isolated session, this is the session's Git worktree. The configured model provider receives this guidance. Tsun skips files over 16 KiB, non-UTF-8 files, and links. The agent looks for more specific instructions near affected files as needed.
+- **Skills.** Install portable `SKILL.md` bundles to teach the agent reusable workflows. Tsun advertises short descriptions and loads a skill's instructions and references only when needed. Tap **Skills** in the composer or type `/skill:name <task>` to pick one yourself. See [Agent Skills](#agent-skills).
 - **Subagents.** Inspired by T3 Code's `delegate_task`: the agent can send a focused brief to a fresh, read-only child using the same workspace and model. The child's conversation starts with the brief. The child can read and list workspace files but cannot use the shell, edit, or delegate. It runs in the foreground, counts toward provider usage, and returns findings in an expandable **Subagent** card. Stop cancels it along with the parent. Up to two children per message, one at a time, with a two-minute and eight-step budget each. Background command support is separate; subagents still have no background mode or separate child sessions.
 - **Permission modes.** *Ask first* asks before every edit and command. *Auto-edit* (the default) applies edits and asks before commands. *Full access* runs edits and commands without asking. The app remembers your last explicitly selected mode for new sessions until you forget the pairing. Session messaging asks for permission outside Full access.
 - **Web tools.** `web_fetch` reads text or HTML from public HTTP(S) URLs on default ports, with no redirects, cookies, or private network addresses. `web_search` uses Brave Search, Tavily, or Firecrawl when `BRAVE_SEARCH_API_KEY`, `TAVILY_API_KEY`, or `FIRECRAWL_API_KEY` is set in the daemon environment, and tries the providers in that order. Each variable may hold several keys separated by commas or newlines (the `…_API_KEYS` alias works too); a rejected, rate-limited, or exhausted key falls through to the next one, then to the next provider. Queries are sent to the provider; don't include private information. Web requests require approval outside Full access.
@@ -63,6 +64,35 @@ A session is a conversation with a coding agent about one project. The daemon ru
 - **Delete a session.** In the session switcher or **Recent**, long-press a session (or tap its **⋯** menu), choose **Delete session**, and confirm. Finish or stop any running work first. This permanently removes the conversation from Tsun, not the project files, Git worktree, branch, or checkpoints.
 
 Sessions are saved under `STATE_DIR/threads/` and reload when the daemon restarts (up to 24, three working at once), as long as the daemon has a chance to exit cleanly. Their worktrees, branches, and checkpoint refs stay on disk.
+
+### Agent Skills
+
+Tsun uses the [Agent Skills format](https://agentskills.io/specification), inspired by [Pi's skills](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/skills.md). A skill is a directory with YAML frontmatter in `SKILL.md`, plus optional `references/`, `scripts/`, and `assets/`. Copy the whole folder, not just its Markdown file.
+
+| Scope | Locations, highest priority first |
+| --- | --- |
+| One project | `.tsun/skills/`, `.agents/skills/`, `.claude/skills/`, `.pi/skills/` |
+| All projects on this daemon | `STATE_DIR/skills/` |
+| All projects for the Debian user | `~/.agents/skills/`, `~/.claude/skills/`, `~/.pi/agent/skills/` |
+
+Project skills take precedence over daemon and user skills with the same name. Tsun scans these locations (including nested groups of skills) each turn; no restart is needed. **Skills** shows the source, manual-only status, and discovery warnings, and lets you preview `SKILL.md` before using it. Before a session starts, the picker previews the project checkout. An isolated session actually loads from its own worktree, so **commit project skills** before starting a fresh isolated session. Edits you make inside an existing worktree are available to that session on its next turn.
+
+Try the [release-review example](examples/workspace/.agents/skills/release-review/SKILL.md) from `init-demo.sh --samples`, or save this as `.agents/skills/code-review/SKILL.md` in a project:
+
+```markdown
+---
+name: code-review
+description: Review a proposed code change for bugs, regressions, and missing tests.
+---
+
+1. Read the diff and the affected tests.
+2. Report actionable findings with file and line references, highest severity first.
+3. Say what you verified and what you couldn't verify. Do not edit files unless asked.
+```
+
+Use **Skills → code-review**, then send your task, or type `/skill:code-review Review the current diff`. The picker inserts the command into your draft rather than sending it immediately. Without an explicit selection, the model sees only names and descriptions and calls `load_skill` when one applies. `disable-model-invocation: true` hides a skill from automatic selection but keeps it in the picker. Explicit selection starts a new turn; wait for the current run to finish before using it.
+
+Activated skills can use `read_skill_resource` to read bundled UTF-8 files by relative path, for example `references/checklist.md`. Use normal tools if a workflow needs to run a script. Discovery and activation never execute anything, and metadata such as `allowed-tools` cannot grant permissions. Read and trust bundles before installing them: descriptions of discoverable skills, and instructions and resources when loaded, are sent to your model provider. Loaded content may remain in the session's history. The name must match the folder (1–64 lowercase letters, digits or single hyphens), the description is limited to 1,024 characters, and `SKILL.md` to 32 KiB. The catalog and per-turn reads are bounded, and skill discovery and resource reads skip links.
 
 ### Model providers
 

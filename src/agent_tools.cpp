@@ -72,6 +72,13 @@ std::vector<ToolSpec> build_tools() {
                 {"path", {{"type", "string"}, {"description", "Directory or file to search (default: the root)"}}},
                 {"glob", {{"type", "string"}, {"description", "Only search files whose names match, e.g. *.kt"}}}},
                 {"pattern"})},
+        {"load_skill", "Load the instructions for a relevant skill from the available skills catalog. "
+            "Call this before using the skill. Loading a skill does not run its scripts or change permissions.",
+            schema({{"name", {{"type", "string"}, {"description", "Exact skill name from the catalog"}}}}, {"name"})},
+        {"read_skill_resource", "Read a UTF-8 reference, script source, or asset from an activated skill. "
+            "This is read-only; it does not execute scripts.",
+            schema({{"name", {{"type", "string"}, {"description", "Exact name of an activated skill"}}},
+                {"resource", {{"type", "string"}, {"description", "Path relative to the skill directory"}}}}, {"name", "resource"})},
         {"delegate_task",
             "Ask a fresh read-only coding agent on the same model to investigate one focused question in this workspace. "
             "Waits for a summary. Give a self-contained task with relevant paths and no secrets; the child cannot see this "
@@ -540,7 +547,7 @@ std::optional<std::string> validate_call(const ToolCall& call, const std::string
     const auto& properties = spec->schema["properties"];
     for (const auto& [key, value] : call.input.items()) {
         if (!properties.contains(key)) return "Unexpected field: " + key;
-            if (value.is_null() && key != "background") continue;
+        if (value.is_null() && key != "background") continue;
         const auto type = properties[key]["type"].get<std::string>();
         const bool ok = type == "string" ? value.is_string() : type == "integer" ? is_int(&value)
             : type == "boolean" ? value.is_boolean() : true;
@@ -589,6 +596,9 @@ Json describe_call(const ToolCall& call, const std::string& root_path) {
     if (call.name == "write_file") return {{"title", "Write"}, {"detail", relative(text_field(input, "path"))}};
     if (call.name == "edit_file") return {{"title", "Edit"}, {"detail", relative(text_field(input, "path"))}};
     if (call.name == "list_files") return {{"title", "List"}, {"detail", relative(text_field(input, "path"))}};
+    if (call.name == "load_skill") return {{"title", "Skill"}, {"detail", clip(text_field(input, "name"), 64)}};
+    if (call.name == "read_skill_resource") return {{"title", "Skill resource"},
+        {"detail", clip(text_field(input, "name"), 64) + " · " + clip(text_field(input, "resource"), 400)}};
     if (call.name == "delegate_task") return {{"title", "Subagent"}, {"detail", clip(text_field(input, "task"), 400)}};
     if (call.name == "message_session") return {{"title", "Message session"},
         {"detail", clip(text_field(input, "session_id"), 24) + "\n" + clip(text_field(input, "message"), 2048)}};
