@@ -1037,7 +1037,8 @@ class DaemonTest(unittest.TestCase):
             openai_stream(content="The first line is committed base."),
             openai_stream(content="I heard back from the other session."),
         ]
-        source_id = self.post("/v1/threads", {"workspace": "demo", "provider": "local", "mode": "full",
+        # Auto-edit must still ask before a privacy-sensitive session message.
+        source_id = self.post("/v1/threads", {"workspace": "demo", "provider": "local", "mode": "edits",
                               "prompt": "Source-only context"}, 201)["id"]
         source, _ = self.thread_until(source_id, lambda t, _: t["state"] == "waiting")
         # Changing modes must not implicitly approve privacy-sensitive messages.
@@ -1046,6 +1047,7 @@ class DaemonTest(unittest.TestCase):
         self.post(f"/v1/threads/{source_id}/approval", {"call": source["pendingCall"], "decision": "allow"})
         source, items = self.thread_until(source_id, lambda t, _: t["state"] == "idle")
         self.assertIsNone(source["error"])
+        self.assertEqual(source["mode"], "full")
         tool = next(e for e in items if e.get("name") == "message_session")
         self.assertEqual(tool["status"], "done")
         self.assertIn("The first line is committed base.", tool["output"])
@@ -1071,6 +1073,27 @@ class DaemonTest(unittest.TestCase):
         self.thread_until(target_id, lambda t, _: t["state"] == "idle" and t["runs"] == 3)
         self.assertNotIn("What is the first line?", json.dumps(self.model.requests[-1]["body"]["messages"]))
 
+    def test_session_message_in_full_mode_runs_without_approval(self):
+        self.model.script.append(openai_stream(content="Ready to answer."))
+        target_id = self.post("/v1/threads", {"workspace": "demo", "provider": "local",
+                              "prompt": "Target"}, 201)["id"]
+        self.thread_until(target_id, lambda t, _: t["state"] == "idle")
+        self.model.script += [
+            openai_stream(calls=[("peer", "message_session", {"session_id": target_id, "message": "What is the first line?"})],
+                          finish="tool_calls"),
+            openai_stream(content="The target says the first line is committed base."),
+            openai_stream(content="The target says the first line is committed base."),
+        ]
+        source_id = self.post("/v1/threads", {"workspace": "demo", "provider": "local", "mode": "full",
+                              "prompt": "Ask the target"}, 201)["id"]
+        # Full access sends the session message without waiting for approval.
+        source, items = self.thread_until(source_id, lambda t, _: t["state"] == "idle")
+        self.assertIsNone(source["error"])
+        self.assertIsNone(source["pendingCall"])
+        tool = next(e for e in items if e.get("name") == "message_session")
+        self.assertEqual(tool["status"], "done")
+        self.assertIn("committed base", tool["output"])
+
     def test_stopping_a_session_message_cancels_the_targets_read_only_turn(self):
         self.model.script.append(openai_stream(content="Ready."))
         target_id = self.post("/v1/threads", {"workspace": "demo", "provider": "local", "prompt": "Target"}, 201)["id"]
@@ -1080,9 +1103,8 @@ class DaemonTest(unittest.TestCase):
                           finish="tool_calls"),
             self.model.hang,
         ]
-        source_id = self.post("/v1/threads", {"workspace": "demo", "provider": "local", "prompt": "Ask the target"}, 201)["id"]
-        source, _ = self.thread_until(source_id, lambda t, _: t["state"] == "waiting")
-        self.post(f"/v1/threads/{source_id}/approval", {"call": source["pendingCall"], "decision": "allow"})
+        source_id = self.post("/v1/threads", {"workspace": "demo", "provider": "local", "mode": "full",
+                              "prompt": "Ask the target"}, 201)["id"]
         deadline = time.monotonic() + 5
         while len(self.model.requests) < 3:
             self.assertLess(time.monotonic(), deadline, "the target model was never called")

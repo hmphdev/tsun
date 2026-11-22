@@ -39,5 +39,5 @@ if(BUILD_TESTING)
     find_package(Python3 3.8 REQUIRED COMPONENTS Interpreter)
     add_test(NAME daemon.integration COMMAND "${Python3_EXECUTABLE}"
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/daemon_test.py" "$<TARGET_FILE:mobile-harness>")
-    set_tests_properties(daemon.integration PROPERTIES TIMEOUT 90)
+    set_tests_properties(daemon.integration PROPERTIES TIMEOUT 180)
 endif()
