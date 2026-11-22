@@ -259,7 +259,7 @@ internal fun RunState(run: Run, modifier: Modifier = Modifier) {
 
 internal enum class Glyph {
     Menu, Runs, Folder, File, Image, Next, Down, Back, Up, Stop, Export, Plus, Refresh,
-    Terminal, Pencil, Eye, Search, Branch, Diff, Check, Cross, Shield, Chevron,
+    Terminal, Pencil, Eye, Search, Branch, Diff, Check, Cross, Shield, Chevron, More,
 }
 
 @Composable
@@ -309,6 +309,7 @@ internal fun LineIcon(glyph: Glyph, modifier: Modifier = Modifier, color: Color 
                 drawPath(path, color, style = stroke)
             }
             when (glyph) {
+                Glyph.More -> for (x in listOf(5f, 12f, 19f)) drawCircle(color, 1.6f, Offset(x, 12f))
                 Glyph.Menu -> { line(4f, 7f, 20f, 7f); line(4f, 12f, 14f, 12f); line(4f, 17f, 20f, 17f) }
                 Glyph.Runs, Glyph.Terminal -> {
                     drawRoundRect(color, Offset(3f, 4.5f), Size(18f, 15f), CornerRadius(2.5f), style = stroke)

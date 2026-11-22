@@ -96,6 +96,7 @@ internal data class AgentThread(
     val provider: String, val providerLabel: String, val model: String, val branch: String?, val filesReady: Boolean,
     val runs: Int, val pendingCall: String?, val additions: Int, val deletions: Int, val filesChanged: Int,
     val copiedFiles: Int, val error: String?, val canSteer: Boolean, val backgroundCommands: Int, val canStop: Boolean,
+    val canDelete: Boolean?,
 ) {
     val active get() = state != "idle"
 }
@@ -188,6 +189,10 @@ internal class DaemonApi(private val pairing: Pairing) {
             ThreadPage(response.getJSONObject("thread").thread(), response.getLong("rev"),
                 response.getBoolean("reset"), response.getJSONArray("items").mapObjects { it.threadItem() }.filterNotNull())
         }
+
+    suspend fun deleteThread(id: String) {
+        request("/v1/threads/${encode(id)}", "DELETE") { _, _ -> Unit }
+    }
 
     suspend fun startThread(workspace: String, prompt: String, mode: Mode, provider: String?): AgentThread =
         post("/v1/threads", JSONObject().put("workspace", workspace).put("prompt", prompt).put("mode", mode.wire)
@@ -342,6 +347,7 @@ private fun JSONObject.thread(): AgentThread = AgentThread(
     deletions = getInt("deletions"), filesChanged = getInt("filesChanged"), copiedFiles = optInt("copiedFiles"),
     error = optStringOrNull("error"), canSteer = optBoolean("canSteer"), backgroundCommands = optInt("backgroundCommands"),
     canStop = optBoolean("canStop", getString("state") != "idle"),
+    canDelete = if (has("canDelete")) optBoolean("canDelete") else null,
 )
 
 private fun JSONObject.fileStat() = FileStat(

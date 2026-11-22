@@ -526,8 +526,11 @@ struct Agents::Thread {
     bool saved = false; // a thread that predates this revision of the file still gets written
     std::mutex disk_mutex;
     std::optional<std::uint64_t> written_rev; // guarded by disk_mutex
+    // Removal holds both mutex_ and disk_mutex; readers hold either one.
+    bool removed = false;
 
     bool active() const { return state != "idle"; }
+    bool can_remove() const { return !active() && background_count == 0 && background_results.empty(); }
     bool can_stop() const { return (active() && !cancel) || background_count > 0 || !background_results.empty(); }
 };
 
@@ -638,7 +641,7 @@ void Agents::save_thread(Thread& thread, const Json& document) const {
     // let an older snapshot overwrite the transcript (or replay a delivered result).
     const std::lock_guard lock(thread.disk_mutex);
     const auto rev = document.at("rev").get<std::uint64_t>();
-    if (thread.written_rev && rev <= *thread.written_rev) return;
+    if (thread.removed || (thread.written_rev && rev <= *thread.written_rev)) return;
     const auto path = threads_path_ + "/" + thread.id + ".json";
     const auto temporary = path + ".tmp";
     try {
@@ -731,7 +734,9 @@ std::shared_ptr<Agents::Thread> Agents::restore(const std::string& path) const {
     const auto stored = Json::parse(text, nullptr, false);
     if (!stored.is_object()) return {};
     const auto id = stored.value("id", std::string{});
-    if (id.empty()) return {};
+    // The ID is also the transcript's filename, used by saves and deletion.
+    if (id.size() != 24 || id.find_first_not_of("0123456789abcdef") != std::string::npos ||
+        path != threads_path_ + "/" + id + ".json") return {};
     auto thread = std::make_shared<Thread>();
     thread->id = id;
     thread->workspace = stored.value("workspace", std::string{});
@@ -835,6 +840,7 @@ Json Agents::summary(const Thread& thread) const {
         {"compacting", thread.compacting},
         {"backgroundCommands", thread.background_count},
         {"canStop", thread.can_stop()},
+        {"canDelete", thread.can_remove()},
         {"pendingCall", thread.pending_call.empty() ? Json(nullptr) : Json(thread.pending_call)},
         {"additions", thread.additions}, {"deletions", thread.deletions}, {"filesChanged", thread.files_changed},
         {"copiedFiles", thread.copied_files}, {"copiedLines", thread.copied_lines},
@@ -867,13 +873,9 @@ Json Agents::create(const Workspace& workspace, const Json& body) {
     }
     // Make room by forgetting the oldest idle thread; its worktree stays on disk.
     while (threads_.size() >= max_threads) {
-        const auto oldest = std::find_if(threads_.rbegin(), threads_.rend(), [](const auto& t) {
-            return !t->active() && t->background_count == 0 && t->background_results.empty();
-        });
+        const auto oldest = std::find_if(threads_.rbegin(), threads_.rend(), [](const auto& t) { return t->can_remove(); });
         if (oldest == threads_.rend()) throw Error(409, "Too many threads are active");
-        if ((*oldest)->worker.joinable()) (*oldest)->worker.join();
-        ::unlink((threads_path_ + "/" + (*oldest)->id + ".json").c_str());
-        threads_.erase(std::prev(oldest.base()));
+        remove_idle(*oldest);
     }
 
     auto thread = std::make_shared<Thread>();
@@ -1060,12 +1062,34 @@ Json Agents::list() const {
     return {{"threads", std::move(items)}, {"capacity", max_active}};
 }
 
+void Agents::remove(std::string_view id) {
+    const std::lock_guard lock(mutex_);
+    const auto thread = find(id);
+    if (!thread->can_remove()) throw Error(409, "Wait for the session to finish or stop it before deleting");
+    remove_idle(thread);
+}
+
+void Agents::remove_idle(std::shared_ptr<Thread> thread) {
+    // mutex_ is held. An idle worker may still be saving, but won't take mutex_ again.
+    if (thread->worker.joinable()) thread->worker.join();
+    const std::lock_guard disk_lock(thread->disk_mutex);
+    const auto path = threads_path_ + "/" + thread->id + ".json";
+    // A pending periodic save may still hold the thread, so keep it from restoring the file.
+    for (const auto& file : {path + ".tmp", path}) {
+        if (::unlink(file.c_str()) < 0 && errno != ENOENT) throw Error(500, "Could not delete the saved session");
+    }
+    thread->removed = true;
+    threads_.remove(thread);
+    changed_.notify_all();
+}
+
 Json Agents::read(std::string_view id, std::uint64_t since, std::chrono::milliseconds wait) const {
     std::unique_lock lock(mutex_);
     const auto thread = find(id);
     if (since == thread->rev && wait.count() > 0) {
-        changed_.wait_for(lock, wait, [&] { return thread->rev != since || shutting_down_; });
+        changed_.wait_for(lock, wait, [&] { return thread->rev != since || thread->removed || shutting_down_; });
     }
+    if (thread->removed) throw Error(404, "Thread not found");
     const bool reset = since > thread->rev;
     auto items = Json::array();
     for (const auto& entry : thread->items) {

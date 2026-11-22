@@ -250,6 +250,10 @@ int serve(const tsun::Configuration& config, httplib::SSLServer& server) {
         const auto wait = std::min<std::uint64_t>(number_query(req, "wait", 0), 2000);
         respond(res, agents.read(req.matches[1].str(), number_query(req, "since", 0), std::chrono::milliseconds(wait)));
     });
+    server.Delete(thread_route, [&](const Request& req, Response& res) {
+        agents.remove(req.matches[1].str());
+        res.status = 204;
+    });
     server.Post(std::string(thread_route) + "/settings", [&](const Request& req, Response& res) {
         respond(res, agents.update(req.matches[1].str(), object_body(req)));
     });

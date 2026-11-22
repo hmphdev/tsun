@@ -5,9 +5,11 @@ import android.content.ClipboardManager
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.layout.Arrangement
@@ -564,6 +566,7 @@ internal fun NewSessionScreen(
     onStart: (prompt: String, mode: Mode, provider: String?) -> Unit,
     onPreset: (Preset) -> Unit,
     onOpen: (AgentThread) -> Unit,
+    onDelete: (AgentThread) -> Unit,
 ) {
     val draft = rememberTextFieldState()
     var providerId by rememberSaveable { mutableStateOf<String?>(null) }
@@ -586,7 +589,9 @@ internal fun NewSessionScreen(
             }
             if (recent.isNotEmpty()) {
                 item { Eyebrow("RECENT", Modifier.padding(top = 34.dp, bottom = 6.dp)) }
-                items(recent.take(5), key = { it.id }) { thread -> ThreadRow(thread, selected = false) { onOpen(thread) } }
+                items(recent.take(5), key = { it.id }) { thread ->
+                    ThreadRow(thread, selected = false, onClick = { onOpen(thread) }, onDelete = { onDelete(thread) })
+                }
             }
         }
         error?.let { Notice(it, Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), error = true) }
@@ -639,12 +644,15 @@ private fun PresetPicker(presets: List<Preset>, enabled: Boolean, onPreset: (Pre
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-internal fun ThreadRow(thread: AgentThread, selected: Boolean, onClick: () -> Unit) {
+internal fun ThreadRow(thread: AgentThread, selected: Boolean, onClick: () -> Unit, onDelete: () -> Unit) {
+    var menuOpen by remember(thread.id) { mutableStateOf(false) }
     Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
         .background(if (selected) inks.accentWash else Color.Transparent)
-        .clickable(role = Role.Button, onClick = onClick).heightIn(min = 48.dp)
-        .padding(horizontal = 12.dp, vertical = 7.dp),
+        .combinedClickable(role = Role.Button, onClick = onClick, onLongClickLabel = "Session options",
+            onLongClick = { menuOpen = true }).heightIn(min = 48.dp)
+        .padding(start = 12.dp, top = 7.dp, bottom = 7.dp),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         StatusDot(threadColor(thread), pulsing = thread.active || thread.backgroundCommands > 0)
         Column(Modifier.weight(1f)) {
@@ -667,6 +675,15 @@ internal fun ThreadRow(thread: AgentThread, selected: Boolean, onClick: () -> Un
         }
         if (thread.additions + thread.deletions > 0) DiffStat(thread.additions, thread.deletions)
         if (thread.copiedFiles > 0) CopiedNote(thread.copiedFiles)
+        Box {
+            GlyphButton(Glyph.More, "Options for ${thread.title}", tint = inks.quiet) { menuOpen = true }
+            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                DropdownMenuItem(
+                    text = { Text("Delete session", color = inks.danger) },
+                    onClick = { menuOpen = false; onDelete() },
+                )
+            }
+        }
     }
 }
 

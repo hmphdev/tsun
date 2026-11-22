@@ -1426,6 +1426,52 @@ class DaemonTest(unittest.TestCase):
         self.post("/v1/threads", {"workspace": "demo", "prompt": "   "}, 400)
         self.api("GET", "/v1/threads/" + "0" * 24, status=404)
 
+    def test_delete_session_permanently_without_removing_worktree(self):
+        self.model.script += [anthropic_stream([{"type": "text", "text": "Done."}], "end_turn")] * 2
+        keep = self.post("/v1/threads", {"workspace": "demo", "prompt": "Keep me"}, 201)["id"]
+        self.thread_until(keep, lambda t, _: t["state"] == "idle")
+        thread = self.post("/v1/threads", {"workspace": "isolated", "prompt": "Delete me"}, 201)
+        thread_id = thread["id"]
+        route = f"/v1/threads/{thread_id}"
+        thread, _ = self.thread_until(thread_id, lambda t, _: t["state"] == "idle")
+        self.assertTrue(thread["canDelete"])
+        worktree = self.state / "worktrees" / f"isolated-{thread_id}"
+        (worktree / "draft.txt").write_text("uncommitted work", encoding="utf-8")
+        branch_before = self.git(self.repo, "rev-parse", thread["branch"])
+
+        self.request("DELETE", route, auth=False, status=401)
+        self.assertEqual(self.request("DELETE", route, status=204)[0], b"")
+        self.assertEqual([t["id"] for t in self.api("GET", "/v1/threads")["threads"]], [keep])
+        self.api("GET", route, status=404)
+        self.api("DELETE", route, status=404)
+        self.api("GET", f"/v1/entries?workspace=isolated&thread={thread_id}", status=404)
+        self.restart()
+        self.api("GET", route, status=404)
+        self.assertFalse((self.state / "threads" / f"{thread_id}.json").exists())
+        self.assertEqual([t["id"] for t in self.api("GET", "/v1/threads")["threads"]], [keep])
+        self.assertEqual((worktree / "draft.txt").read_text(encoding="utf-8"), "uncommitted work")
+        self.assertEqual(self.git(self.repo, "rev-parse", thread["branch"]), branch_before)
+
+    def test_delete_session_requires_work_to_stop(self):
+        self.model.script += [
+            openai_stream(calls=[("build", "bash", {"command": "exec sleep 60", "background": True})],
+                          finish="tool_calls"),
+            openai_stream(content="Build started."),
+        ]
+        thread_id = self.post("/v1/threads", {"workspace": "demo", "provider": "local", "prompt": "Build"}, 201)["id"]
+        route = f"/v1/threads/{thread_id}"
+        thread, _ = self.thread_until(thread_id, lambda t, _: t["state"] == "waiting")
+        self.assertFalse(thread["canDelete"])
+        self.api("DELETE", route, status=409)
+        self.post(route + "/approval", {"call": thread["pendingCall"], "decision": "allow"})
+        thread, _ = self.thread_until(thread_id, lambda t, _: t["state"] == "idle")
+        self.assertEqual(thread["backgroundCommands"], 1)
+        self.assertFalse(thread["canDelete"])
+        self.api("DELETE", route, status=409)
+        self.post(route + "/interrupt", {})
+        self.thread_until(thread_id, lambda t, _: t["canDelete"])
+        self.request("DELETE", route, status=204)
+
     def test_threads_and_transcripts_survive_a_daemon_restart(self):
         self.model.script += [anthropic_stream([{"type": "text", "text": "Remember this note."}], "end_turn")]
         thread = self.post("/v1/threads", {"workspace": "isolated", "prompt": "Keep this thread"}, 201)

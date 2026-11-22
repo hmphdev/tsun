@@ -89,6 +89,9 @@ internal fun Workbench(
     var fileBusy by remember { mutableStateOf(false) }
     var discardTo by remember { mutableStateOf<(() -> Unit)?>(null) }
     var confirmForget by remember { mutableStateOf(false) }
+    var deleteTarget by remember(api) { mutableStateOf<AgentThread?>(null) }
+    var deleting by remember(api) { mutableStateOf(false) }
+    var deleteError by remember(api) { mutableStateOf<String?>(null) }
     var actionError by remember { mutableStateOf<String?>(null) }
     var submitting by remember { mutableStateOf(false) }
 
@@ -105,6 +108,7 @@ internal fun Workbench(
             while (true) {
                 if (!hasFreshOverview) {
                     try {
+                        val requestVersion = refresh
                         val overview = try { api.overview() }
                         catch (e: ConnectException) {
                             if (startDebian == null || attemptedRoot) throw e
@@ -117,7 +121,8 @@ internal fun Workbench(
                         }
                         catalog = overview.catalog
                         runs = overview.runs
-                        threads = overview.threads
+                        // A request started before a deletion shouldn't put its row back.
+                        if (requestVersion == refresh) threads = overview.threads
                         online = true
                         offline = null
                         canRetryDebian = false
@@ -150,6 +155,7 @@ internal fun Workbench(
     }
 
     fun openThread(target: AgentThread) = navigate {
+        if (threads.items.none { it.id == target.id }) return@navigate
         workspaceId = target.workspace
         route = Route.Thread
         routeId = target.id
@@ -175,12 +181,10 @@ internal fun Workbench(
         actionError = null
     }
 
-    fun upsert(updated: AgentThread) {
-        val existing = threads.items.firstOrNull { it.id == updated.id }
+    fun updateThread(updated: AgentThread) {
+        val existing = threads.items.firstOrNull { it.id == updated.id } ?: return
         if (existing == updated) return
-        val items = if (existing == null) listOf(updated) + threads.items
-            else threads.items.map { if (it.id == updated.id) updated else it }
-        threads = threads.copy(items = items)
+        threads = threads.copy(items = threads.items.map { if (it.id == updated.id) updated else it })
     }
 
     fun startThread(prompt: String, mode: Mode, provider: String?) {
@@ -191,7 +195,7 @@ internal fun Workbench(
         scope.launch {
             try {
                 val created = api.startThread(target.id, prompt, mode, provider)
-                upsert(created)
+                threads = threads.copy(items = listOf(created) + threads.items.filterNot { it.id == created.id })
                 openThread(created)
             } catch (e: Exception) { actionError = e.userMessage() }
             finally { submitting = false }
@@ -226,6 +230,41 @@ internal fun Workbench(
         }
     }
 
+    fun isShowingThread(id: String): Boolean = when (route) {
+        Route.Thread, Route.Review -> routeId == id
+        Route.Files -> fileIsThread && fileOwner == id
+        else -> false
+    }
+
+    fun confirmDelete(target: AgentThread) {
+        deleteError = null
+        deleteTarget = target
+    }
+
+    fun deleteThread(target: AgentThread) {
+        if (deleting || (isShowingThread(target.id) && (dirty || fileBusy))) return
+        deleting = true
+        deleteError = null
+        scope.launch {
+            try {
+                api.deleteThread(target.id)
+                if (isShowingThread(target.id)) {
+                    route = Route.Home
+                    routeId = null
+                    fileOwner = null
+                    fileIsThread = false
+                }
+                threads = threads.copy(items = threads.items.filterNot { it.id == target.id })
+                screenState.removeState("thread:${target.id}")
+                screenState.removeState("files:${target.workspace}:${target.id}")
+                refresh++
+                deleteTarget = null
+            } catch (e: Exception) {
+                deleteError = e.userMessage()
+            } finally { deleting = false }
+        }
+    }
+
     discardTo?.let { change ->
         AlertDialog(
             onDismissRequest = { discardTo = null }, containerColor = inks.raised,
@@ -242,6 +281,35 @@ internal fun Workbench(
             text = { Text("This removes the key from the app. Agents and presets already running in Debian keep going.") },
             confirmButton = { TextButton({ confirmForget = false; navigate(onForget) }) { Text("Forget", color = inks.danger) } },
             dismissButton = { TextButton({ confirmForget = false }) { Text("Cancel") } },
+        )
+    }
+
+    deleteTarget?.let { target ->
+        val current = threads.items.firstOrNull { it.id == target.id } ?: target
+        val blocked = when {
+            isShowingThread(target.id) && (dirty || fileBusy) -> "Save or discard your editor changes first."
+            !online -> "Connect to Debian to delete this session."
+            current.canDelete == null -> "Update the Tsun daemon to delete sessions from the app."
+            !current.canDelete -> "Wait for this session to finish or stop it first."
+            else -> null
+        }
+        val confirmation = if (target.branch == null) "Project files stay on disk."
+            else "The Git worktree and branch ${target.branch} stay on disk."
+        AlertDialog(
+            onDismissRequest = { if (!deleting) deleteTarget = null }, containerColor = inks.raised,
+            title = { Text("Delete session?") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("This permanently deletes the conversation “${target.title}”. $confirmation")
+                    (deleteError ?: blocked)?.let { Text(it, color = inks.danger) }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { deleteThread(target) }, enabled = !deleting && blocked == null) {
+                    Text(if (deleting) "Deleting…" else "Delete", color = if (blocked == null) inks.danger else inks.faint)
+                }
+            },
+            dismissButton = { TextButton(onClick = { deleteTarget = null }, enabled = !deleting) { Text("Cancel") } },
         )
     }
 
@@ -270,7 +338,7 @@ internal fun Workbench(
                     workspaces, threads.items, runs.items, current = routeId.takeIf { route == Route.Thread || route == Route.Run },
                     online = online, port = port,
                     onNew = { go(Route.Home) },
-                    onThread = ::openThread, onRun = ::openRun,
+                    onThread = ::openThread, onRun = ::openRun, onDelete = ::confirmDelete,
                     onProjectFiles = { project -> openFiles(null, false, project) },
                     onForget = { scope.launch { drawer.close() }; confirmForget = true },
                 )
@@ -303,7 +371,7 @@ internal fun Workbench(
                             EmptyNote("Session not found", "Start a new one from the menu.", Modifier.padding(20.dp))
                         } else screenState.SaveableStateProvider("thread:$id") {
                             ThreadScreen(api, id, thread, providers, handlesBack = drawer.isClosed,
-                                onBack = { go(Route.Home) }, onThread = ::upsert, onMode = onMode,
+                                onBack = { go(Route.Home) }, onThread = ::updateThread, onMode = onMode,
                                 onReview = { navigate { route = Route.Review } },
                                 onFiles = { openFiles(id, true) })
                         }
@@ -360,7 +428,7 @@ internal fun Workbench(
                             recent = remember(threads.items, workspace?.id) { threads.items.filter { it.workspace == workspace?.id }.take(5) },
                             online = online, busy = submitting, error = actionError,
                             mode = mode, onMode = onMode, onWorkspace = { workspaceId = it.id },
-                            onStart = ::startThread, onPreset = ::launchPreset, onOpen = ::openThread,
+                            onStart = ::startThread, onPreset = ::launchPreset, onOpen = ::openThread, onDelete = ::confirmDelete,
                         )
                     }
                 }
@@ -373,7 +441,7 @@ internal fun Workbench(
 private fun SessionDrawer(
     workspaces: List<Workspace>, threads: List<AgentThread>, runs: List<Run>, current: String?,
     online: Boolean, port: Int, onNew: () -> Unit, onThread: (AgentThread) -> Unit, onRun: (Run) -> Unit,
-    onProjectFiles: (Workspace) -> Unit, onForget: () -> Unit,
+    onProjectFiles: (Workspace) -> Unit, onForget: () -> Unit, onDelete: (AgentThread) -> Unit,
 ) {
     val threadsByProject = remember(threads) { threads.groupBy { it.workspace } }
     val runsByProject = remember(runs) { runs.groupBy { it.workspace } }
@@ -407,7 +475,8 @@ private fun SessionDrawer(
                         style = MaterialTheme.typography.bodySmall, color = inks.faint)
                 }
                 items(projectThreads, key = { "thread:${it.id}" }) { thread ->
-                    ThreadRow(thread, selected = thread.id == current) { onThread(thread) }
+                    ThreadRow(thread, selected = thread.id == current,
+                        onClick = { onThread(thread) }, onDelete = { onDelete(thread) })
                 }
                 items(projectRuns, key = { "run:${it.id}" }) { run ->
                     Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
