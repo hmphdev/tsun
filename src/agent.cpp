@@ -23,6 +23,12 @@ constexpr std::size_t max_threads = 24;
 constexpr int max_steps = 120;
 constexpr std::size_t max_pending_steering = 8;
 constexpr std::size_t prompt_limit = 64 * 1024;
+// While a reply streams, changes are only visible to pollers at this cadence:
+// every token still lands in the item, and `finished` flushes the last bump.
+constexpr auto stream_notify_interval = std::chrono::milliseconds(100);
+// Cap on the text of a still-streaming item sent over the wire: the app shows the
+// tail of a growing block, and the full text is sent once the block finishes.
+constexpr std::size_t wire_stream_text_limit = 16 * 1024;
 
 std::string random_id() {
     std::array<unsigned char, 12> bytes{};
@@ -270,6 +276,8 @@ struct Agents::Thread {
     std::map<std::string, std::size_t> index;
     std::vector<std::string> steering; // item IDs, in order of receipt; guarded by mutex_
     std::uint64_t rev = 0, next_item = 0;
+    // When the last streamed-text change was published (rev bump + notify), for throttling.
+    std::chrono::steady_clock::time_point streamed_since{};
     int runs = 0;
     std::string pending_call;
     std::string decision;
@@ -338,6 +346,18 @@ void Agents::touch(Thread& thread, Json& item) {
     changed_.notify_all();
 }
 
+void Agents::touch_streamed(Thread& thread, Json& item) {
+    // Tokens can arrive faster than a frame; publish at a fixed cadence instead.
+    // The item's revision (and the thread's) only moves when observers are told,
+    // so long-polls, the wire, and the saver stay proportional to the batch, not
+    // the token rate. The text itself lands in the item on every token, and
+    // `finished` always publishes the final state.
+    const auto now = std::chrono::steady_clock::now();
+    if (now - thread.streamed_since < stream_notify_interval) return;
+    thread.streamed_since = now;
+    touch(thread, item);
+}
+
 Json* Agents::item(Thread& thread, const std::string& id) {
     const auto it = thread.index.find(id);
     return it == thread.index.end() ? nullptr : &thread.items[it->second];
@@ -400,6 +420,13 @@ void Agents::save_changed(bool everything) {
         const std::lock_guard lock(mutex_);
         for (const auto& thread : threads_) {
             if (!everything && thread->saved && thread->saved_rev == thread->rev && thread->saved_state == thread->state) continue;
+            // A still-streaming item would be rewritten on the next tick anyway; skip
+            // mid-stream threads so the agent loop is not blocked on a full-document
+            // dump of the growing thinking text every second.
+            if (!everything && thread->active() &&
+                std::any_of(thread->items.rbegin(), thread->items.rend(), [](const Json& entry) {
+                    return entry.value("streaming", false);
+                })) continue;
             pending.emplace_back(thread, document(*thread));
         }
     }
@@ -668,7 +695,22 @@ Json Agents::read(std::string_view id, std::uint64_t since, std::chrono::millise
     const bool reset = since > thread->rev;
     auto items = Json::array();
     for (const auto& entry : thread->items) {
-        if (reset || entry["rev"].get<std::uint64_t>() > since) items.push_back(entry);
+        if (reset || entry["rev"].get<std::uint64_t>() > since) {
+            // While a reply still streams, cap the text carried over the wire: a
+            // long thinking block is re-sent on every batch otherwise, growing the
+            // payload (and the re-parse on the phone) with every poll. The full
+            // text ships once the block finishes.
+            if (entry.value("streaming", false) && entry.contains("text") && entry["text"].is_string()) {
+                auto page = entry;
+                if (page["text"].get_ref<const std::string&>().size() > wire_stream_text_limit) {
+                    page["text"] = page["text"].get_ref<const std::string&>().substr(
+                        page["text"].get_ref<const std::string&>().size() - wire_stream_text_limit);
+                }
+                items.push_back(std::move(page));
+            } else {
+                items.push_back(entry);
+            }
+        }
     }
     return {{"thread", summary(*thread)}, {"rev", thread->rev}, {"reset", reset}, {"items", std::move(items)}};
 }
@@ -1007,8 +1049,11 @@ bool Agents::run_steps(Thread& thread) {
             const auto found = slots.find(slot);
             if (found == slots.end()) return;
             if (auto* entry = item(thread, found->second)) {
-                (*entry)["text"] = (*entry)["text"].get<std::string>() + std::string(text);
-                touch(thread, *entry);
+                // Append in place: get<std::string>() would copy the whole accumulated
+                // text per token, which turns long thinking blocks quadratic while the
+                // daemon-global mutex is held.
+                (*entry)["text"].get_ref<std::string&>().append(text);
+                touch_streamed(thread, *entry);
             }
         };
         events.finished = [&](std::size_t slot, std::string_view kind, const Json& info) {
@@ -1026,6 +1071,7 @@ bool Agents::run_steps(Thread& thread) {
                 (*entry)["detail"] = described["detail"];
                 (*entry)["status"] = "queued";
             }
+            // `finished` lands after throttled touches, so always publish here.
             touch(thread, *entry);
         };
 

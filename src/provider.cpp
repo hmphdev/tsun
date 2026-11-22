@@ -263,15 +263,15 @@ public:
             const auto& delta = event["delta"];
             const auto kind = delta.value("type", "");
             if (kind == "text_delta") {
-                const auto text = delta.value("text", "");
-                block["text"] = block.value("text", "") + text;
+                const auto& text = delta["text"].get_ref<const std::string&>();
+                block["text"].get_ref<std::string&>().append(text);
                 if (events_.delta) events_.delta(index, "text", text);
             } else if (kind == "thinking_delta") {
-                const auto text = delta.value("thinking", "");
-                block["thinking"] = block.value("thinking", "") + text;
+                const auto& text = delta["thinking"].get_ref<const std::string&>();
+                block["thinking"].get_ref<std::string&>().append(text);
                 if (events_.delta) events_.delta(index, "thinking", text);
             } else if (kind == "signature_delta") {
-                block["signature"] = block.value("signature", "") + delta.value("signature", "");
+                block["signature"].get_ref<std::string&>().append(delta["signature"].get_ref<const std::string&>());
             } else if (kind == "input_json_delta") {
                 const auto text = delta.value("partial_json", "");
                 partial_[index] += text;
@@ -472,7 +472,7 @@ public:
         const auto& delta = choice["delta"];
         for (const char* key : {"reasoning_content", "reasoning"}) {
             if (delta.contains(key) && delta[key].is_string() && !delta[key].get_ref<const std::string&>().empty()) {
-                append_reasoning(delta[key].get<std::string>());
+                append_reasoning(delta[key].get_ref<const std::string&>());
                 break;
             }
         }
@@ -552,7 +552,7 @@ private:
         if (part.contains("id") && part["id"].is_string()) call.id = part["id"];
         if (part.contains("function") && part["function"].is_object()) {
             const auto& function = part["function"];
-            if (function.contains("name") && function["name"].is_string()) call.name += function["name"].get<std::string>();
+            if (function.contains("name") && function["name"].is_string()) call.name += function["name"].get_ref<const std::string&>();
             if (function.contains("arguments") && function["arguments"].is_string()) {
                 const auto& chunk = function["arguments"].get_ref<const std::string&>();
                 call.arguments += chunk;

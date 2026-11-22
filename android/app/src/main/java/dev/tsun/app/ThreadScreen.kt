@@ -337,7 +337,15 @@ private fun UserTurn(entry: ThreadItem.User) {
 private fun ThinkingRow(entry: ThreadItem.Thinking) {
     if (!entry.streaming && entry.text.isBlank()) return
     var open by remember(entry.id) { mutableStateOf(false) }
-    Column(Modifier.fillMaxWidth().animateContentSize()) {
+    // While streaming, lay out only a tail window of the growing text: re-breaking
+    // the whole block on every batch makes a long thought quadratic on the phone.
+    // The full text is shown once the block finishes and is cheap to render once.
+    val body = remember(entry.text, entry.streaming) {
+        if (!entry.streaming) entry.text.trim()
+        else if (entry.text.length <= STREAMING_TEXT_WINDOW) entry.text.trim()
+        else "…" + entry.text.takeLast(STREAMING_TEXT_WINDOW).trimStart()
+    }
+    Column(Modifier.fillMaxWidth().then(if (entry.streaming) Modifier else Modifier.animateContentSize())) {
         Row(Modifier.clip(RoundedCornerShape(8.dp)).clickable(enabled = entry.text.isNotBlank(), role = Role.Button) { open = !open }
             .padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -346,11 +354,13 @@ private fun ThinkingRow(entry: ThreadItem.Thinking) {
             if (entry.text.isNotBlank()) LineIcon(if (open) Glyph.Down else Glyph.Chevron, color = inks.faint, size = 12)
         }
         if (open) {
-            Text(entry.text.trim(), Modifier.padding(start = 14.dp, top = 4.dp),
+            Text(body, Modifier.padding(start = 14.dp, top = 4.dp),
                 style = ProseType.copy(fontStyle = FontStyle.Italic, fontSize = ProseType.fontSize * 0.88f), color = inks.quiet)
         }
     }
 }
+
+private const val STREAMING_TEXT_WINDOW = 2000
 
 private fun toolGlyph(name: String) = when (name) {
     "bash" -> Glyph.Terminal

@@ -53,6 +53,7 @@ private:
     Json summary(const Thread& thread) const;
     Json& add_item(Thread& thread, Json item);
     void touch(Thread& thread, Json& item);
+    void touch_streamed(Thread& thread, Json& item); // publish stream deltas at a fixed cadence
     Json* item(Thread& thread, const std::string& id);
     Json document(const Thread& thread) const;
     std::shared_ptr<Thread> restore(const std::string& path) const;
