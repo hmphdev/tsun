@@ -23,6 +23,7 @@ constexpr std::size_t max_active = 3;
 constexpr std::size_t max_threads = 24;
 constexpr int max_steps = 120;
 constexpr std::size_t max_pending_steering = 8;
+constexpr std::size_t max_parallel_tools = 4;
 constexpr std::size_t max_background_per_thread = 2;
 constexpr std::size_t max_background = 6;
 constexpr std::size_t prompt_limit = 64 * 1024;
@@ -393,6 +394,8 @@ std::string system_prompt(const std::string& root_path, const std::string& label
         "- Use list_files and search to locate code and read_file to inspect it. read_file also returns PNG, JPEG, "
         "GIF, and WebP images, so you can look at screenshots and diagrams instead of guessing. Prefer edit_file for "
         "targeted changes and write_file for new files or full rewrites.\n"
+        "- Send independent read_file, list_files, search, and delegate_task calls together in one reply so Tsun can "
+        "run them in parallel. If a call needs another call's result, wait for that result before requesting it.\n"
         "- Bash starts a fresh non-interactive shell at the workspace root each time; cd and exports do not persist. "
         "Commands time out; do not start servers or detach processes yourself. For long builds or tests, use Bash's "
         "background=true option. Tsun delivers the result automatically, even after your reply ends. Do not poll or "
@@ -1641,6 +1644,12 @@ bool Agents::run_steps(Thread& thread) {
             return tool.name == "load_skill" || (tool.name == "read_skill_resource" && skills.active.empty());
         });
     }
+    // Skill calls share turn state; all other tools outside this allowlist
+    // keep their existing ordering and approvals.
+    const auto can_parallelize = [](const ToolCall& call) {
+        return tool_risk(call.name) == ToolRisk::Read &&
+            (call.name == "read_file" || call.name == "list_files" || call.name == "search" || call.name == "delegate_task");
+    };
     int remaining_delegates = 2;
     int remaining_messages = 2;
     bool completed = false;
@@ -1775,10 +1784,48 @@ bool Agents::run_steps(Thread& thread) {
         }
 
         Turn results{Turn::Role::Tools, {}, {}, {}, {}, {}};
+        // Publish cards as calls finish, but replay results in call order.
+        results.results.resize(calls.size());
+        const ToolContext context{root, root_path, thread.cancel};
+        const auto finish_tool = [&](std::size_t i, ToolOutcome outcome) {
+            // Called with mutex_ held, including from parallel workers.
+            const auto& call = calls[i];
+            const bool stopped = thread.cancel && (can_parallelize(call) || tool_risk(call.name) == ToolRisk::Peer);
+            thread.input_tokens += outcome.input_tokens;
+            thread.output_tokens += outcome.output_tokens;
+            auto& result = results.results[i];
+            result.content = std::move(outcome.content);
+            result.error = outcome.error || stopped;
+            if (!stopped) result.image = std::move(outcome.image);
+            if (stopped && !outcome.error) result.content = "Interrupted by the user.";
+            if (auto* entry = item(thread, call_items[i])) {
+                (*entry)["status"] = stopped ? "cancelled" : outcome.error ? "error" : "done";
+                (*entry)["output"] = result.content.size() > 24 * 1024 ? result.content.substr(0, 24 * 1024) + "…" : result.content;
+                if (!stopped) for (const auto& [key, value] : outcome.display.items()) (*entry)[key] = value;
+                touch(thread, *entry);
+            }
+        };
+        const auto execute = [&](const ToolCall& call) -> ToolOutcome {
+            try {
+                if (thread.cancel) return {"Interrupted by the user.", true};
+                if (call.name == "delegate_task") return run_delegate(context, call, *provider, guidance, effort);
+                if (call.name == "message_session") return message_session(thread, call);
+                if (call.name == "load_skill" || call.name == "read_skill_resource") return skills.call(call);
+                return run_tool(context, call);
+            } catch (const std::exception& error) {
+                return {error.what(), true};
+            }
+        };
+        // Workers borrow the state above and join before it goes out of scope.
+        // Never join with mutex_ held: workers also need it to publish results.
+        std::vector<std::jthread> workers;
         for (std::size_t i = 0; i < calls.size(); ++i) {
             const auto& call = calls[i];
+            const bool parallel = can_parallelize(call);
+            if (!parallel || workers.size() == max_parallel_tools) workers.clear();
             const auto& item_id = call_items[i];
-            ToolResult result{call.id, call.name, {}, true};
+            auto& result = results.results[i];
+            result = {call.id, call.name, {}, true};
             auto rejection = reply.stop == StopReason::MaxTokens
                 ? std::optional<std::string>("Your reply hit the output limit before this call was complete. Send it again in smaller pieces.")
                 : validate_call(call, root_path);
@@ -1836,37 +1883,41 @@ bool Agents::run_steps(Thread& thread) {
                     }
                 } else {
                     set_status("running");
-                    const ToolContext context{root, root_path, thread.cancel};
-                    const bool delegated = call.name == "delegate_task";
-                    if (delegated) --remaining_delegates;
-                    const auto outcome = [&] {
+                    if (call.name == "delegate_task") --remaining_delegates;
+                    if (parallel && (!workers.empty() || (i + 1 < calls.size() && can_parallelize(calls[i + 1])))) {
+                        try {
+                            workers.emplace_back([&, i] {
+                                auto outcome = execute(calls[i]);
+                                const std::lock_guard lock(mutex_);
+                                finish_tool(i, std::move(outcome));
+                            });
+                            continue;
+                        } catch (const std::system_error&) {
+                            // Fall back to inline execution if the daemon cannot start another worker.
+                            lock.unlock();
+                            workers.clear();
+                            lock.lock();
+                            if (!thread.cancel && !thread.steering.empty()) {
+                                skip_for_steering();
+                                continue;
+                            }
+                        }
+                    }
+                    auto outcome = [&] {
                         if (background_bash(call)) return start_background(thread, item_id, call);
                         lock.unlock();
-                        auto result = delegated ? run_delegate(context, call, *provider, guidance, effort)
-                            : call.name == "message_session" ? message_session(thread, call)
-                            : call.name == "load_skill" || call.name == "read_skill_resource" ? skills.call(call)
-                            : run_tool(context, call);
+                        auto output = execute(call);
                         lock.lock();
-                        return result;
+                        return output;
                     }();
                     if (!outcome.error && (call.name == "write_file" || call.name == "edit_file")) {
                         thread.run_writes.insert(written_path(thread.root_path, call.input));
                     }
-                    thread.input_tokens += outcome.input_tokens;
-                    thread.output_tokens += outcome.output_tokens;
-                    result.content = outcome.content;
-                    result.error = outcome.error;
-                    result.image = outcome.image;
-                    if (auto* entry = item(thread, item_id)) {
-                        (*entry)["status"] = (delegated || risk == ToolRisk::Peer) && thread.cancel ? "cancelled" : outcome.error ? "error" : "done";
-                        (*entry)["output"] = outcome.content.size() > 24 * 1024 ? outcome.content.substr(0, 24 * 1024) + "…" : outcome.content;
-                        for (const auto& [key, value] : outcome.display.items()) (*entry)[key] = value;
-                        touch(thread, *entry);
-                    }
+                    finish_tool(i, std::move(outcome));
                 }
             }
-            results.results.push_back(std::move(result));
         }
+        workers.clear();
         {
             const std::lock_guard lock(mutex_);
             thread.history.push_back(std::move(results));

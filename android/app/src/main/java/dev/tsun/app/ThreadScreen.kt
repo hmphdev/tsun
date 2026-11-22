@@ -316,7 +316,7 @@ private fun Conversation(
                 }
             }
             if (thread != null && thread.active) item(key = "working") {
-                WorkingLine(thread, entries.lastOrNull()?.entry?.value)
+                WorkingLine(thread, entries)
             }
             item(key = "end") { Spacer(Modifier.height(1.dp)) }
         }
@@ -537,13 +537,17 @@ private fun RunSummary(entry: ThreadItem.RunEnd, onReview: () -> Unit) {
 }
 
 @Composable
-private fun WorkingLine(thread: AgentThread, tail: ThreadItem?) {
-    val streamingText = tail is ThreadItem.Text && tail.streaming
-    if (streamingText) return
+private fun WorkingLine(thread: AgentThread, entries: List<TranscriptRow>) {
+    val tail = entries.lastOrNull()?.entry?.value
+    if (tail is ThreadItem.Text && tail.streaming) return
+    val running = entries.asReversed().asSequence().map { it.entry.value }
+        .takeWhile { it.run == thread.runs }
+        .filterIsInstance<ThreadItem.Tool>().filter { it.status == "running" }.toList()
     val label = when {
         thread.state == "preparing" -> "Preparing the worktree…"
         thread.state == "waiting" -> "Waiting for your approval"
-        tail is ThreadItem.Tool && tail.status == "running" -> "Running ${tail.title.lowercase()}…"
+        running.size > 1 -> "Running ${running.size} tools…"
+        running.size == 1 -> "Running ${running.single().title.lowercase()}…"
         else -> "Working…"
     }
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(9.dp),

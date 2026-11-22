@@ -1,4 +1,4 @@
-from contextlib import closing
+from contextlib import closing, suppress
 import base64
 import hashlib
 import http.client
@@ -97,17 +97,17 @@ class MockProvider:
                     reply = reply(body)
                 if reply is None:
                     payload = json.dumps({"error": {"type": "invalid_request_error", "message": "script exhausted"}}).encode()
-                    self.send_response(400)
-                    self.send_header("Content-Type", "application/json")
+                    status, content_type = 400, "application/json"
+                else:
+                    payload = reply
+                    status, content_type = 200, "text/event-stream"
+                # Stop closes the client socket before a stalled mock sends its reply.
+                with suppress(BrokenPipeError, ConnectionResetError):
+                    self.send_response(status)
+                    self.send_header("Content-Type", content_type)
                     self.send_header("Content-Length", str(len(payload)))
                     self.end_headers()
                     self.wfile.write(payload)
-                    return
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.send_header("Content-Length", str(len(reply)))
-                self.end_headers()
-                self.wfile.write(reply)
 
         self.release = threading.Event()
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -1391,6 +1391,110 @@ class DaemonTest(unittest.TestCase):
         self.assertEqual((thread["inputTokens"], thread["outputTokens"]), (80, 20))
         worktree = self.state / "worktrees" / f"isolated-{thread_id}"
         self.assertFalse((worktree / "forbidden.txt").exists())
+
+    def test_parallel_tools_publish_out_of_order_but_replay_in_order(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def child(body):
+            if "first area" in body["messages"][-1]["content"]:
+                if not release.wait(10):
+                    return None
+                return openai_stream(content="Slow findings.")
+            return openai_stream(content="Fast findings.")
+
+        self.model.script += [
+            openai_stream(calls=[
+                ("slow", "delegate_task", {"task": "Inspect the first area"}),
+                ("fast", "delegate_task", {"task": "Inspect the second area"}),
+                ("root", "list_files", {}),
+                ("sub", "list_files", {"path": "sub"}),
+                ("next_batch", "read_file", {"path": "sub/inside.txt"}),
+                ("write", "write_file", {"path": "after.txt", "content": "after the reads"}),
+                ("read_back", "read_file", {"path": "after.txt"}),
+            ], finish="tool_calls"),
+            # Either subagent can reach the mock first; route by its brief.
+            child, child,
+            openai_stream(content="Finished."),
+        ]
+        thread_id = self.post("/v1/threads", {"workspace": "demo", "provider": "local", "mode": "ask",
+                              "prompt": "Inspect both areas and write a note"}, 201)["id"]
+        _, items = self.thread_until(thread_id, lambda _, items: sum(
+            e.get("call") in ("fast", "root", "sub") and e["status"] == "done" for e in items) == 3, timeout=5)
+        tools = [e for e in items if e["kind"] == "tool"]
+        self.assertEqual([e["status"] for e in tools], ["running", "done", "done", "done", "queued", "queued", "queued"])
+        self.assertIn("Fast findings.", tools[1]["output"])
+        self.assertIn("sub/inside.txt", tools[2]["output"])
+        self.assertIn("inside.txt", tools[3]["output"])
+        self.assertEqual(len(self.model.requests), 3)  # parent cannot continue with a partial batch
+        release.set()
+
+        thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "waiting")
+        tools = [e for e in items if e["kind"] == "tool"]
+        self.assertEqual([e["status"] for e in tools], ["done"] * 5 + ["waiting", "queued"])
+        self.assertEqual(thread["pendingCall"], tools[5]["id"])
+        self.assertFalse((self.workspace / "after.txt").exists())
+        self.post(f"/v1/threads/{thread_id}/approval", {"call": thread["pendingCall"], "decision": "allow"})
+        thread, _ = self.thread_until(thread_id, lambda t, _: t["state"] == "idle")
+        self.assertIsNone(thread["error"])
+        results = [m for m in self.model.requests[-1]["body"]["messages"] if m["role"] == "tool"]
+        self.assertEqual([m["tool_call_id"] for m in results], [e["call"] for e in tools])
+        self.assertIn("Slow findings.", results[0]["content"])
+        self.assertIn("after the reads", results[-1]["content"])
+        self.assertEqual((thread["inputTokens"], thread["outputTokens"]), (80, 20))
+
+    def test_stop_cancels_parallel_tools_and_keeps_a_complete_history(self):
+        calls = [(call_id, "delegate_task", {"task": f"Read {call_id}"}) for call_id in ("one", "two")]
+        calls.append(("queued", "write_file", {"path": "not-written.txt", "content": "no"}))
+        self.model.script += [openai_stream(calls=calls, finish="tool_calls"), self.model.hang, self.model.hang]
+        thread_id = self.post("/v1/threads", {"workspace": "demo", "provider": "local", "mode": "full",
+                              "prompt": "Read both areas"}, 201)["id"]
+        deadline = time.monotonic() + 5
+        while len(self.model.requests) < 3:
+            self.assertLess(time.monotonic(), deadline, "both subagents must start before either replies")
+            time.sleep(0.02)
+        route = f"/v1/threads/{thread_id}"
+        self.post(route + "/interrupt", {})
+        thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle", timeout=5)
+        self.assertIsNone(thread["error"])
+        self.assertEqual([e["status"] for e in items if e["kind"] == "tool"], ["cancelled"] * 3)
+        self.assertFalse((self.workspace / "not-written.txt").exists())
+        self.assertEqual(len(self.model.requests), 3)
+
+        self.model.script.append(openai_stream(content="OK."))
+        self.post(route + "/messages", {"text": "Never mind"}, 202)
+        self.thread_until(thread_id, lambda t, _: t["state"] == "idle" and t["runs"] == 2)
+        results = [m for m in self.model.requests[-1]["body"]["messages"] if m["role"] == "tool"]
+        self.assertEqual([m["tool_call_id"] for m in results], ["one", "two", "queued"])
+        self.assertTrue(all("stopped" in m["content"] or "Interrupted" in m["content"] for m in results))
+
+    def test_steering_waits_for_parallel_tools_but_skips_ordered_edits(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def child(_body):
+            if not release.wait(10):
+                return None
+            return openai_stream(content="Finished reading.")
+
+        calls = [(call_id, "delegate_task", {"task": f"Read {call_id}"}) for call_id in ("one", "two")]
+        calls.append(("queued", "write_file", {"path": "not-written.txt", "content": "no"}))
+        self.model.script += [openai_stream(calls=calls, finish="tool_calls"), child, child,
+                              openai_stream(content="I will leave the files alone.")]
+        thread_id = self.post("/v1/threads", {"workspace": "demo", "provider": "local", "mode": "full",
+                              "prompt": "Read both areas and write a note"}, 201)["id"]
+        self.thread_until(thread_id, lambda _, items: sum(
+            e.get("call") in ("one", "two") and e["status"] == "running" for e in items) == 2)
+        self.post(f"/v1/threads/{thread_id}/messages", {"text": "No more edits", "steer": True}, 202)
+        release.set()
+        thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle")
+        self.assertIsNone(thread["error"])
+        self.assertEqual([e["status"] for e in items if e["kind"] == "tool"], ["done", "done", "cancelled"])
+        self.assertFalse((self.workspace / "not-written.txt").exists())
+        messages = self.model.requests[-1]["body"]["messages"]
+        self.assertEqual([m["tool_call_id"] for m in messages[-4:-1]], ["one", "two", "queued"])
+        self.assertIn("steering", messages[-2]["content"])
+        self.assertEqual(messages[-1], {"role": "user", "content": "No more edits"})
 
     def test_delegate_caps_children_per_message(self):
         calls = [{"type": "tool_use", "id": f"toolu_{i}", "name": "delegate_task", "input": {"task": f"Inspect part {i}"}}
