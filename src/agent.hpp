@@ -27,6 +27,8 @@ public:
     const ProviderSet& providers() const { return providers_; }
     Json create(const Workspace& workspace, const Json& body);
     Json list() const;
+    Json skills(const FileRoot& workspace) const;
+    Json skill_file(const FileRoot& workspace, std::string_view name) const;
     Json read(std::string_view id, std::uint64_t since, std::chrono::milliseconds wait) const;
     void remove(std::string_view id);
     Json send(std::string_view id, const Json& body);

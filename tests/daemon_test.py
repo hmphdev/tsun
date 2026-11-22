@@ -167,6 +167,8 @@ class DaemonTest(unittest.TestCase):
         isolated_preset = {"id": "edit", "argv": ["/bin/sh", "-c",
             "printf 'preset output\\n' > result.txt; pwd; echo ready; exec /bin/sleep 60"]}
 
+        self.home = root / "home"
+        self.home.mkdir()
         self.state = root / "state"
         self.state.mkdir(mode=0o700)
         self.token_file = self.state / "token"
@@ -220,6 +222,7 @@ class DaemonTest(unittest.TestCase):
     def start_daemon(self, extra_env=None):
         # Search keys from the host are dropped, so a developer's own keys never reach a test.
         env = {k: v for k, v in os.environ.items() if k not in SEARCH_KEY_VARIABLES}
+        env["HOME"] = str(self.home)
         env.update(extra_env or {})
         self.process = subprocess.Popen(
             [str(DAEMON), str(self.state)], stdout=subprocess.PIPE,
@@ -1123,6 +1126,144 @@ class DaemonTest(unittest.TestCase):
         self.assertEqual([r["tool_use_id"] for r in results], ["toolu_a", "toolu_b", "toolu_c", "toolu_d", "toolu_e"])
         self.assertTrue(all(r.get("is_error") for r in results))
         self.assertEqual(history[-1]["content"][-1], {"type": "text", "text": "Never mind"})
+
+    def write_skill(self, name, description, instructions, *, location=None, extra=""):
+        directory = (location or self.workspace / ".agents" / "skills") / name
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: {description}\n{extra}---\n\n{instructions}\n", encoding="utf-8")
+        return directory
+
+    def test_skill_discovery_precedence_and_diagnostics(self):
+        self.write_skill("review", ">-\n  Review code: check edge cases\n  and test coverage.", "PROJECT_BODY",
+                         location=self.workspace / ".agents" / "skills" / "engineering",
+                         extra='metadata:\n  owner: "Developer tools"\n')
+        self.write_skill("review", "Daemon default", "DAEMON_BODY", location=self.state / "skills")
+        self.write_skill("review", "Personal default", "USER_BODY", location=self.home / ".agents" / "skills")
+        self.write_skill("personal", "Personal workflow", "USER_BODY", location=self.home / ".pi" / "agent" / "skills")
+        self.write_skill("manual", '"Explicit only: 日本語"', "MANUAL_BODY", location=self.state / "skills",
+                         extra="disable-model-invocation: true\n")
+        self.write_skill("wrong-folder", "Invalid name", "BAD_BODY", extra="name: duplicate\n")
+        self.write_skill("huge", "Big", "x" * (33 * 1024))
+        self.write_skill("linked", "Links aren't skills", "LINKED", location=self.workspace.parent / "outside-skills")
+        skills = self.workspace / ".agents" / "skills"
+        (skills / "linked").symlink_to(self.workspace.parent / "outside-skills" / "linked", target_is_directory=True)
+        (skills / "file-link").mkdir()
+        (skills / "file-link" / "SKILL.md").symlink_to(skills / "engineering" / "review" / "SKILL.md")
+        (skills / "hard-link").mkdir()
+        os.link(self.workspace.parent / "outside-skills" / "linked" / "SKILL.md", skills / "hard-link" / "SKILL.md")
+        (skills / "pipe").mkdir()
+        os.mkfifo(skills / "pipe" / "SKILL.md")
+        self.api("GET", "/v1/skills?workspace=demo", auth=False, status=401)
+        catalog = self.api("GET", "/v1/skills?workspace=demo")
+        self.assertEqual(catalog["skills"], [
+            {"name": "manual", "description": "Explicit only: 日本語", "source": "daemon",
+             "path": "STATE_DIR/skills/manual", "manual": True},
+            {"name": "personal", "description": "Personal workflow", "source": "user",
+             "path": "~/.pi/agent/skills/personal", "manual": False},
+            {"name": "review", "description": "Review code: check edge cases and test coverage.", "source": "project",
+             "path": ".agents/skills/engineering/review", "manual": False},
+        ])
+        self.assertIn("Shadowed by .agents/skills/engineering/review", str(catalog["warnings"]))
+        for invalid in ("wrong-folder", "huge", "file-link", "hard-link", "pipe"):
+            self.assertIn(invalid + "/SKILL.md", str(catalog["warnings"]))
+        self.assertNotIn("_BODY", json.dumps(catalog))
+        preview = self.api("GET", "/v1/skills?workspace=demo&name=review")
+        self.assertIn("PROJECT_BODY", preview["text"])
+        self.assertNotIn("DAEMON_BODY", preview["text"])
+        self.assertEqual(preview["path"], ".agents/skills/engineering/review/SKILL.md")
+        self.api("GET", "/v1/skills?workspace=demo&name=missing", status=404)
+        self.api("GET", "/v1/skills?workspace=demo&name=../token", status=400)
+
+    def test_model_activates_skill_reads_resources_and_still_needs_approval(self):
+        directory = self.write_skill("release-review", "Review release notes.", "REVIEW_WORKFLOW", location=self.state / "skills",
+                                     extra='allowed-tools: "Bash(*)"\n')
+        (directory / "references").mkdir()
+        (directory / "references" / "checks.md").write_text("REFERENCE_CHECKLIST", encoding="utf-8")
+        (directory / "references" / "link").symlink_to(self.workspace / ".secret")
+        self.write_skill("manual", "HIDDEN_DESCRIPTION", "MANUAL_BODY", extra="disable-model-invocation: true\n")
+        self.write_skill("unrelated", "Different workflow.", "UNRELATED_BODY")
+        self.model.script += [
+            openai_stream(calls=[
+                ("not-yet", "read_skill_resource", {"name": "release-review", "resource": "references/checks.md"}),
+                ("manual", "load_skill", {"name": "manual"}),
+                ("load", "load_skill", {"name": "release-review"}),
+                ("repeat", "load_skill", {"name": "release-review"}),
+            ], finish="tool_calls"),
+            openai_stream(calls=[
+                ("ref", "read_skill_resource", {"name": "release-review", "resource": "references/checks.md"}),
+                ("escape", "read_skill_resource", {"name": "release-review", "resource": "../token"}),
+                ("absolute", "read_skill_resource", {"name": "release-review", "resource": str(self.state / "token")}),
+                ("link", "read_skill_resource", {"name": "release-review", "resource": "references/link"}),
+                ("command", "bash", {"command": "touch skill-script-ran"}),
+            ], finish="tool_calls"),
+            openai_stream(content="Reviewed."),
+        ]
+        thread_id = self.post("/v1/threads", {"workspace": "demo", "prompt": "Review a release.", "provider": "local"}, 201)["id"]
+        waiting, _ = self.thread_until(thread_id, lambda t, _: t["state"] == "waiting")
+        self.assertFalse((self.workspace / "skill-script-ran").exists())
+        self.post(f"/v1/threads/{thread_id}/approval", {"call": waiting["pendingCall"], "decision": "deny"})
+        thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle")
+        self.assertIsNone(thread["error"])
+        calls = {e["call"]: e for e in items if e["kind"] == "tool"}
+        self.assertEqual({k: v["status"] for k, v in calls.items()}, {
+            "not-yet": "error", "manual": "error", "load": "done", "repeat": "done", "ref": "done",
+            "escape": "error", "absolute": "error", "link": "error", "command": "denied",
+        })
+        first, second, third = [r["body"] for r in self.model.requests]
+        self.assertIn("Review release notes.", first["messages"][0]["content"])
+        self.assertIn("Different workflow.", first["messages"][0]["content"])
+        for private in ("REVIEW_WORKFLOW", "REFERENCE_CHECKLIST", "UNRELATED_BODY", "HIDDEN_DESCRIPTION", "MANUAL_BODY"):
+            self.assertNotIn(private, json.dumps(first))
+        self.assertEqual(json.dumps(second).count("REVIEW_WORKFLOW"), 1)
+        self.assertNotIn("REFERENCE_CHECKLIST", json.dumps(second))
+        self.assertIn("REFERENCE_CHECKLIST", json.dumps(third))
+        self.assertNotIn(self.token, json.dumps(third))
+        self.assertFalse((self.workspace / "skill-script-ran").exists())
+
+    def test_explicit_skill_uses_committed_worktree_then_refreshes_on_reply(self):
+        directory = self.write_skill("manual", "Private routing metadata", "COMMITTED_WORKFLOW",
+                                     location=self.repo / ".claude" / "skills", extra="disable-model-invocation: true\n")
+        self.git(self.repo, "add", ".claude")
+        self.git(self.repo, "-c", "user.name=Tsun Test", "-c", "user.email=test@example.invalid",
+                 "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "Add a skill")
+        (directory / "SKILL.md").write_text((directory / "SKILL.md").read_text().replace("COMMITTED", "CHECKOUT"))
+        self.model.script += [
+            anthropic_stream([{"type": "text", "text": "Reviewed."}], "end_turn"),
+            openai_stream(content="Reviewed again."),
+        ]
+        thread_id = self.post("/v1/threads", {"workspace": "isolated", "prompt": "/skill:manual Check notes.txt"}, 201)["id"]
+        messages = f"/v1/threads/{thread_id}/messages"
+        thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle")
+        self.assertIsNone(thread["error"])
+        self.assertEqual(next(e["text"] for e in items if e["kind"] == "user"), "/skill:manual Check notes.txt")
+        self.assertTrue(any(e.get("text") == "Activated skill: manual" for e in items))
+        first = self.model.requests[0]["body"]
+        self.assertNotIn("Private routing metadata", json.dumps(first["system"]))
+        self.assertNotIn("COMMITTED_WORKFLOW", json.dumps(first["system"]))
+        self.assertIn("COMMITTED_WORKFLOW", json.dumps(first["messages"]))
+        self.assertIn("User task:\\nCheck notes.txt", json.dumps(first["messages"]))
+        self.assertNotIn("CHECKOUT_WORKFLOW", json.dumps(first))
+        self.assertIn("read_skill_resource", {t["name"] for t in first["tools"]})
+        self.assertNotIn("load_skill", {t["name"] for t in first["tools"]})
+        route = f"/v1/skills?workspace=isolated&thread={thread_id}"
+        self.api("GET", f"/v1/skills?workspace=demo&thread={thread_id}", status=404)
+        self.assertTrue(self.api("GET", route)["skills"][0]["manual"])
+        worktree, = (self.state / "worktrees").glob(f"*-{thread_id}")
+        self.write_skill("manual", "Updated routing metadata", "WORKTREE_WORKFLOW", location=worktree / ".claude" / "skills",
+                         extra="disable-model-invocation: true\n")
+        self.assertEqual(self.api("GET", route)["skills"][0]["description"], "Updated routing metadata")
+        self.post(messages, {"text": "/skill:../manual"}, 400)
+        self.post(messages, {"text": "/skill:missing"}, 202)
+        thread, _ = self.thread_until(thread_id, lambda t, _: t["state"] == "idle" and t["runs"] == 2)
+        self.assertIn("Skill not found: missing", thread["error"])
+        self.assertEqual(len(self.model.requests), 1)
+        self.post(messages, {"text": "/skill:manual Do it again", "provider": "local"}, 202)
+        thread, _ = self.thread_until(thread_id, lambda t, _: t["state"] == "idle" and t["runs"] == 3)
+        self.assertIsNone(thread["error"])
+        second = self.model.requests[1]["body"]
+        self.assertIn("WORKTREE_WORKFLOW", second["messages"][-1]["content"])
+        self.assertNotIn("/skill:missing", json.dumps(second))
 
     def test_agent_loads_worktree_guidance_once_per_turn(self):
         guidance = self.repo / "AGENTS.md"

@@ -1,5 +1,6 @@
 #include "agent.hpp"
 #include "process.hpp"
+#include "skills.hpp"
 
 #include <dirent.h>
 #include <openssl/rand.h>
@@ -467,13 +468,53 @@ Turn turn_from_json(const Json& entry) {
 }
 
 // The FDs only live as long as the process, so threads remember how to reopen their roots.
-std::string root_path_of(const std::shared_ptr<const FileRoot>& root) {
-    if (!root) return {};
-    const auto link = "/proc/self/fd/" + std::to_string(root->directory.get());
+std::string root_path_of(const FileRoot& root) {
+    const auto link = "/proc/self/fd/" + std::to_string(root.directory.get());
     std::array<char, 4096> buffer{};
     const auto size = ::readlink(link.c_str(), buffer.data(), buffer.size() - 1);
     return size > 0 ? std::string(buffer.data(), static_cast<std::size_t>(size)) : std::string{};
 }
+
+std::string root_path_of(const std::shared_ptr<const FileRoot>& root) {
+    return root ? root_path_of(*root) : std::string{};
+}
+
+struct TurnSkills {
+    SkillCatalog catalog;
+    std::set<std::string> active;
+    std::size_t resource_bytes = 0;
+
+    std::string activate(const Skill& skill) {
+        auto instructions = skill.instructions();
+        active.insert(skill.name);
+        return instructions;
+    }
+
+    ToolOutcome call(const ToolCall& call) {
+        constexpr std::size_t activation_limit = 4;
+        constexpr std::size_t resource_budget = 96 * 1024;
+        const auto name = call.input.at("name").get<std::string>();
+        const auto found = catalog.entries.find(name);
+        if (found == catalog.entries.end()) return {"No skill with that name in this turn's catalog.", true};
+        const auto& skill = found->second;
+        try {
+            if (call.name == "load_skill") {
+                if (active.contains(name)) return {"Skill already activated. Its instructions are in this turn's context.", false};
+                if (skill.manual) return {"This is a manual-only skill. The user must invoke /skill:" + name + ".", true};
+                if (active.size() >= activation_limit) return {"This turn has reached its four-skill activation limit.", true};
+                return {activate(skill), false};
+            }
+            if (!active.contains(name)) return {"Activate this skill before reading its resources.", true};
+            const auto resource = call.input.at("resource").get<std::string>();
+            auto text = skill.read_resource(resource);
+            if (text.size() > resource_budget - resource_bytes) return {"This turn has reached its skill resource budget.", true};
+            resource_bytes += text.size();
+            return {std::move(text), false};
+        } catch (const Error& error) {
+            return {error.what(), true};
+        }
+    }
+};
 
 } // namespace
 
@@ -499,6 +540,7 @@ struct Agents::Thread {
     std::string state = "idle"; // preparing, running, waiting, idle
     std::string error;
     std::vector<Turn> history;
+    std::optional<SkillInvocation> invoked_skill; // explicit command for this run only
     std::vector<Json> items;
     std::map<std::string, std::size_t> index;
     std::vector<std::string> steering; // item IDs, in order of receipt; guarded by mutex_
@@ -852,6 +894,7 @@ Json Agents::summary(const Thread& thread) const {
 
 Json Agents::create(const Workspace& workspace, const Json& body) {
     const auto prompt = valid_text(body, "prompt", prompt_limit);
+    auto invocation = skill_invocation(prompt);
     const auto provider_id = body.contains("provider") && body["provider"].is_string()
         ? body["provider"].get<std::string>() : providers_.default_id;
     const auto* provider = providers_.find(provider_id);
@@ -899,6 +942,8 @@ Json Agents::create(const Workspace& workspace, const Json& body) {
         thread->root_path = n > 0 ? std::string(buffer.data(), static_cast<std::size_t>(n)) : "/";
         thread->root = thread->workspace_root;
     }
+    // The command is resolved in the actual worktree, once preparation succeeds.
+    thread->invoked_skill = std::move(invocation);
     threads_.push_front(thread);
     start_run(thread, prompt);
     const auto created = summary(*thread);
@@ -938,7 +983,9 @@ void Agents::start_run(const std::shared_ptr<Thread>& thread, std::optional<std:
         thread->updated_at = now_ms();
         changed_.notify_all();
     }
-    if (prompt) thread->history.push_back({Turn::Role::User, std::move(*prompt), {}, {}, {}, {}});
+    // Only record a skill command in provider history after it resolves. The
+    // user item above still shows the exact slash command even if it fails.
+    if (prompt && !thread->invoked_skill) thread->history.push_back({Turn::Role::User, std::move(*prompt), {}, {}, {}, {}});
 }
 
 ToolOutcome Agents::start_background(Thread& thread, const std::string& item_id, const ToolCall& call) {
@@ -1055,6 +1102,19 @@ ToolOutcome Agents::message_session(Thread& source, const ToolCall& call) {
     return {finished ? "Session message stopped." : "The target session did not answer within 90 seconds.", true};
 }
 
+Json Agents::skills(const FileRoot& workspace) const {
+    return discover_skills(workspace, root_path_of(workspace), state_path_).json();
+}
+
+Json Agents::skill_file(const FileRoot& workspace, std::string_view name) const {
+    if (!valid_skill_name(name)) throw Error(400, "Invalid skill name");
+    const auto catalog = discover_skills(workspace, root_path_of(workspace), state_path_);
+    const auto found = catalog.entries.find(name);
+    if (found == catalog.entries.end()) throw Error(404, "Skill not found in this project or session");
+    const auto file = found->second.read_skill_file();
+    return {{"text", file.text}, {"path", found->second.path + "/SKILL.md"}};
+}
+
 Json Agents::list() const {
     const std::lock_guard lock(mutex_);
     auto items = Json::array();
@@ -1115,6 +1175,7 @@ Json Agents::read(std::string_view id, std::uint64_t since, std::chrono::millise
 
 Json Agents::send(std::string_view id, const Json& body) {
     auto text = valid_text(body, "text", prompt_limit);
+    auto invocation = skill_invocation(text);
     const std::lock_guard lock(mutex_);
     if (shutting_down_) throw Error(503, "Daemon is shutting down");
     const auto thread = find(id);
@@ -1130,6 +1191,7 @@ Json Agents::send(std::string_view id, const Json& body) {
         if (thread->cancel) throw Error(409, "The agent is stopping; wait before replying");
         if (is_effort_command(text)) throw Error(409, "Wait for the run to finish before using /effort");
         if (is_compact_command(text)) throw Error(409, "Wait for the run to finish before using /compact");
+        if (invocation) throw Error(409, "Wait for the run to finish before invoking a skill");
         if (thread->steering.size() >= max_pending_steering) throw Error(409, "Too many steering messages are queued");
         thread->steering.push_back(add_item(*thread, {{"kind", "user"}, {"text", std::move(text)},
             {"steering", "queued"}})["id"].get<std::string>());
@@ -1152,6 +1214,7 @@ Json Agents::send(std::string_view id, const Json& body) {
     if (effort_command(*thread, text)) return summary(*thread);
     // /compact summarizes the conversation so far instead of reaching the model as a prompt.
     if (compact_command(thread, text)) return summary(*thread);
+    thread->invoked_skill = std::move(invocation);
     start_run(thread, std::move(text));
     return summary(*thread);
 }
@@ -1538,12 +1601,46 @@ bool Agents::run_steps(Thread& thread) {
     const auto& root_path = thread.root_path;
     const auto guidance = thread.cancel ? std::string{} : workspace_guidance(root);
     const auto peer = thread.peer;
+    TurnSkills skills;
+    std::optional<SkillInvocation> invocation;
+    {
+        const std::lock_guard lock(mutex_);
+        invocation = std::exchange(thread.invoked_skill, {});
+    }
+    if (!peer && !thread.cancel) skills.catalog = discover_skills(root, root_path, state_path_);
+    auto skill_guidance = skills.catalog.prompt();
+    if (invocation && !thread.cancel) {
+        const auto found = skills.catalog.entries.find(invocation->name);
+        try {
+            if (found == skills.catalog.entries.end()) throw Error(404, "Skill not found: " + invocation->name + ". Open Skills to see what is available in this workspace.");
+            auto instructions = skills.activate(found->second);
+            const std::lock_guard lock(mutex_);
+            if (thread.cancel) return false;
+            // The command remains visible in the transcript, but its expansion in
+            // provider history is the user task and selected guidance, not a system rule.
+            const auto task = invocation->arguments.empty() ? "Use this skill for the current task. Ask if you need more details."
+                : invocation->arguments;
+            thread.history.push_back({Turn::Role::User, "The user explicitly selected this skill. Treat its instructions as task guidance; "
+                "working rules and approvals still apply.\n\n" + instructions + "\n\nUser task:\n" + task, {}, {}, {}, {}});
+            add_item(thread, {{"kind", "notice"}, {"text", "Activated skill: " + invocation->name}});
+        } catch (const Error& error) {
+            const std::lock_guard lock(mutex_);
+            thread.error = error.what();
+            add_item(thread, {{"kind", "notice"}, {"tone", "error"}, {"text", error.what()}});
+            return false;
+        }
+    }
     const auto system = peer
         ? "You are answering a read-only question from another Tsun session. Use your own conversation and workspace. "
           "Answer the latest question concisely, omit secrets and unrelated history, and cite relevant paths. "
           "You can only read and list files during this turn.\nWorkspace: " + root_path + guidance
-        : system_prompt(root_path, thread.workspace_label, thread.branch) + guidance;
-    const auto& tools = peer ? inspection_tools() : agent_tools();
+        : system_prompt(root_path, thread.workspace_label, thread.branch) + guidance + skill_guidance;
+    auto tools = peer ? inspection_tools() : agent_tools();
+    if (!peer && skill_guidance.empty()) {
+        std::erase_if(tools, [&](const auto& tool) {
+            return tool.name == "load_skill" || (tool.name == "read_skill_resource" && skills.active.empty());
+        });
+    }
     int remaining_delegates = 2;
     int remaining_messages = 2;
     bool completed = false;
@@ -1685,8 +1782,9 @@ bool Agents::run_steps(Thread& thread) {
             auto rejection = reply.stop == StopReason::MaxTokens
                 ? std::optional<std::string>("Your reply hit the output limit before this call was complete. Send it again in smaller pieces.")
                 : validate_call(call, root_path);
-            if (peer && std::none_of(tools.begin(), tools.end(), [&](const auto& tool) { return tool.name == call.name; })) {
-                rejection = "A session answering a peer can only read and list files.";
+            if (std::none_of(tools.begin(), tools.end(), [&](const auto& tool) { return tool.name == call.name; })) {
+                if (peer) rejection = "A session answering a peer can only read and list files.";
+                else if (!rejection) rejection = "This tool is not available in the current turn.";
             }
 
             std::unique_lock lock(mutex_);
@@ -1745,7 +1843,9 @@ bool Agents::run_steps(Thread& thread) {
                         if (background_bash(call)) return start_background(thread, item_id, call);
                         lock.unlock();
                         auto result = delegated ? run_delegate(context, call, *provider, guidance, effort)
-                            : call.name == "message_session" ? message_session(thread, call) : run_tool(context, call);
+                            : call.name == "message_session" ? message_session(thread, call)
+                            : call.name == "load_skill" || call.name == "read_skill_resource" ? skills.call(call)
+                            : run_tool(context, call);
                         lock.lock();
                         return result;
                     }();
