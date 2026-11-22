@@ -904,6 +904,155 @@ class DaemonTest(unittest.TestCase):
         self.assertIn("Skipped", messages[-2]["content"])
         self.assertEqual(messages[-1], {"role": "user", "content": "No more edits"})
 
+    def test_background_bash_requires_approval_and_wakes_idle_session(self):
+        self.model.script += [
+            openai_stream(calls=[("build", "bash", {"background": True, "command":
+                "touch build-started; until test -f release-build; do sleep 0.03; done; echo build-complete >&2; exit 7"})],
+                finish="tool_calls"),
+            openai_stream(content="I'll wait for the build result."),
+            openai_stream(content="The build failed with exit code 7."),
+        ]
+        thread_id = self.post("/v1/threads", {"workspace": "demo", "provider": "local", "prompt": "Run the build"}, 201)["id"]
+        route = f"/v1/threads/{thread_id}"
+        thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "waiting")
+        self.assertEqual(thread["backgroundCommands"], 0)
+        self.assertFalse((self.workspace / "build-started").exists())
+        card = next(e for e in items if e.get("call") == "build")
+        self.assertEqual(card["title"], "Background bash")
+        self.post(route + "/approval", {"call": thread["pendingCall"], "decision": "allow"})
+        thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle")
+        self.assertEqual((thread["runs"], thread["backgroundCommands"]), (1, 1))
+        self.assertTrue(thread["canStop"])
+        self.assertEqual(next(e for e in items if e["id"] == card["id"])["status"], "background")
+        bash = next(t["function"] for t in self.model.requests[0]["body"]["tools"] if t["function"]["name"] == "bash")
+        self.assertEqual(bash["parameters"]["properties"]["background"]["type"], "boolean")
+        launch = self.model.requests[1]["body"]["messages"][-1]
+        self.assertEqual((launch["role"], launch["tool_call_id"]), ("tool", "build"))
+        self.assertIn(card["id"], launch["content"])
+        self.assertNotIn("build-complete", launch["content"])
+
+        (self.workspace / "release-build").touch()
+        thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle" and t["runs"] == 2)
+        self.assertEqual(thread["backgroundCommands"], 0)
+        settled = next(e for e in items if e["id"] == card["id"])
+        self.assertEqual((settled["status"], settled["exitCode"], settled["output"].strip()), ("error", 7, "build-complete"))
+        self.assertEqual(sum(e["kind"] == "user" for e in items), 1)
+        messages = self.model.requests[2]["body"]["messages"]
+        self.assertEqual(sum(m.get("tool_call_id") == "build" for m in messages), 1)
+        self.assertIn("Exit code 7", messages[-1]["content"])
+        self.assertIn("build-complete", messages[-1]["content"])
+        self.assertEqual(len(self.model.requests), 3)
+
+    def test_background_bash_delivery_waits_until_tool_batch_is_complete(self):
+        self.model.script += [
+            anthropic_stream([
+                {"type": "tool_use", "id": "background", "name": "bash", "input": {"background": True,
+                    "command": "until test -f release-background; do sleep 0.03; done; printf '\\377result'"}},
+                {"type": "tool_use", "id": "foreground", "name": "bash", "input": {"background": False,
+                    "command": "until test -f release-foreground; do sleep 0.03; done; echo foreground-done"}},
+            ], "tool_use"),
+            anthropic_stream([{"type": "text", "text": "Both commands finished."}], "end_turn"),
+        ]
+        thread_id = self.post("/v1/threads", {"workspace": "demo", "mode": "full", "prompt": "Run two commands"}, 201)["id"]
+        self.thread_until(thread_id, lambda _, i: any(e.get("call") == "foreground" and e["status"] == "running" for e in i))
+        (self.workspace / "release-background").touch()
+        self.thread_until(thread_id, lambda _, i: any(e.get("call") == "background" and e["status"] == "done" for e in i))
+        self.assertEqual(len(self.model.requests), 1)
+        (self.workspace / "release-foreground").touch()
+        thread, _ = self.thread_until(thread_id, lambda t, _: t["state"] == "idle")
+        self.assertEqual(thread["runs"], 1)
+        blocks = self.model.requests[1]["body"]["messages"][-1]["content"]
+        self.assertEqual([b["type"] for b in blocks], ["tool_result", "tool_result", "text"])
+        self.assertEqual([b["tool_use_id"] for b in blocks[:2]], ["background", "foreground"])
+        self.assertIn("foreground-done", blocks[1]["content"])
+        self.assertIn("\ufffdresult", blocks[-1]["text"])
+        self.restart()
+        reloaded = self.api("GET", f"/v1/threads/{thread_id}")
+        self.assertEqual(reloaded["thread"]["runs"], 1)
+        self.assertIn("\ufffdresult", next(e for e in reloaded["items"] if e.get("call") == "background")["output"])
+
+    def test_background_bash_times_out_and_limits_pending_commands(self):
+        self.model.script += [
+            openai_stream(calls=[(f"job-{i}", "bash", {"background": True, "command": "echo waiting; exec sleep 30",
+                "timeout_seconds": 1}) for i in range(3)], finish="tool_calls"),
+            openai_stream(content="Waiting for the results."),
+            openai_stream(content="The jobs timed out."),
+            openai_stream(content="Both timed out."),
+        ]
+        thread_id = self.post("/v1/threads", {"workspace": "demo", "provider": "local", "mode": "full", "prompt": "Run jobs"}, 201)["id"]
+        thread, items = self.thread_until(thread_id, lambda t, i: t["state"] == "idle" and t["backgroundCommands"] == 0
+            and t["runs"] >= 2 and sum(e["kind"] == "notice" and "timed out" in e["text"] for e in i) == 2)
+        cards = [e for e in items if e["kind"] == "tool"]
+        self.assertEqual([e["status"] for e in cards], ["error", "error", "error"])
+        self.assertTrue(all(e["timedOut"] and "waiting" in e["output"] for e in cards[:2]))
+        self.assertIn("already has two", cards[2]["output"])
+        report = self.model.requests[-1]["body"]["messages"]
+        self.assertEqual(sum("Tsun background command result" in (m.get("content") or "") for m in report), 2)
+        self.assertIn("Timed out after 1 second.", json.dumps(report))
+
+    def test_background_bash_rejects_non_boolean_and_does_not_run_if_declined(self):
+        self.model.script += [
+            openai_stream(calls=[("invalid", "bash", {"background": "true", "command": "touch invalid"}),
+                                 ("null", "bash", {"background": None, "command": "touch null"}),
+                                 ("denied", "bash", {"background": True, "command": "touch denied"})], finish="tool_calls"),
+            openai_stream(content="Neither command ran."),
+        ]
+        thread_id = self.post("/v1/threads", {"workspace": "demo", "provider": "local", "prompt": "Run two jobs"}, 201)["id"]
+        route = f"/v1/threads/{thread_id}"
+        thread, _ = self.thread_until(thread_id, lambda t, _: t["state"] == "waiting")
+        self.post(route + "/approval", {"call": thread["pendingCall"], "decision": "deny"})
+        thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle")
+        self.assertEqual(thread["backgroundCommands"], 0)
+        calls = [e for e in items if e["kind"] == "tool"]
+        self.assertEqual([e["status"] for e in calls], ["error", "error", "denied"])
+        self.assertTrue(all("background must be a boolean" in e["output"] for e in calls[:2]))
+        self.assertFalse(any((self.workspace / name).exists() for name in ("invalid", "null", "denied")))
+
+    def test_background_bash_stays_in_worktree_and_checkpoints_on_completion(self):
+        self.model.script += [
+            openai_stream(calls=[("build", "bash", {"background": True, "command":
+                "until test -f release-build; do sleep 0.03; done; echo generated > generated.txt"})], finish="tool_calls"),
+            openai_stream(content="The build is running."),
+            openai_stream(content="The build generated a file."),
+        ]
+        thread_id = self.post("/v1/threads", {"workspace": "isolated", "provider": "local", "mode": "full",
+                               "prompt": "Generate a file"}, 201)["id"]
+        thread, _ = self.thread_until(thread_id, lambda t, _: t["state"] == "idle")
+        self.assertEqual(thread["backgroundCommands"], 1)
+        root = self.state / "worktrees" / f"isolated-{thread_id}"
+        (root / "release-build").touch()
+        thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle" and t["runs"] == 2)
+        self.assertFalse((self.repo / "generated.txt").exists())
+        self.assertEqual((root / "generated.txt").read_text(), "generated\n")
+        checkpoint = next(e["checkpoint"] for e in items if e["kind"] == "run" and e["run"] == 2)
+        self.assertEqual(self.git(root, "show", f"{checkpoint}:generated.txt"), "generated")
+
+    def test_stop_and_shutdown_cancel_background_bash_while_idle(self):
+        for shutdown in (False, True):
+            with self.subTest(shutdown=shutdown):
+                pid_file = f"pid-{shutdown}"
+                self.model.script += [
+                    openai_stream(calls=[("build", "bash", {"background": True, "command":
+                        f"echo $$ > {pid_file}; trap '' TERM; exec sleep 30"})], finish="tool_calls"),
+                    openai_stream(content="Still running."),
+                ]
+                thread_id = self.post("/v1/threads", {"workspace": "demo", "provider": "local", "mode": "full", "prompt": "Run a job"}, 201)["id"]
+                thread, _ = self.thread_until(thread_id, lambda t, _: t["state"] == "idle" and (self.workspace / pid_file).exists())
+                self.assertEqual(thread["backgroundCommands"], 1)
+                pid = int((self.workspace / pid_file).read_text())
+                requests = len(self.model.requests)
+                if shutdown:
+                    self.restart()
+                else:
+                    self.post(f"/v1/threads/{thread_id}/interrupt", {})
+                thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle" and t["backgroundCommands"] == 0)
+                self.assertEqual(thread["runs"], 1)
+                self.assertFalse(thread["canStop"])
+                self.assertEqual(next(e for e in items if e.get("call") == "build")["status"], "cancelled")
+                self.assertEqual(len(self.model.requests), requests)
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
+
     def test_stop_discards_unsent_steering(self):
         started = threading.Event()
 

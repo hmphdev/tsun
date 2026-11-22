@@ -26,6 +26,7 @@ struct ToolContext {
 const std::vector<ToolSpec>& agent_tools();
 const std::vector<ToolSpec>& inspection_tools();
 ToolRisk tool_risk(std::string_view name);
+bool background_bash(const ToolCall& call);
 // Checks a call against its schema and keeps its paths inside the workspace, so
 // the user is never asked to approve a call that cannot run. Returns an error
 // message for the model.

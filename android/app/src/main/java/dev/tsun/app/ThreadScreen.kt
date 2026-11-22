@@ -184,6 +184,7 @@ internal fun ThreadScreen(
             providers = providers, provider = provider, onProvider = { providerId = it.id },
             working = current?.active == true, canSend = current != null && provider?.enabled != false, busy = busy,
             canSteer = canSteer,
+            canStop = current?.canStop == true,
             onSend = { text ->
                 val switch = providerId?.takeIf { !canSteer && it != current?.provider }
                 act {
@@ -375,7 +376,7 @@ private fun toolGlyph(name: String) = when (name) {
 
 @Composable
 private fun statusColor(status: String): Color = when (status) {
-    "running", "streaming" -> inks.amber
+    "running", "streaming", "background" -> inks.amber
     "waiting" -> inks.accent
     "done" -> inks.sage
     "error" -> inks.danger
@@ -398,9 +399,12 @@ private fun ToolRow(entry: ThreadItem.Tool, waiting: Boolean, onDecide: (String,
                 maxLines = 1, overflow = TextOverflow.Ellipsis)
             when (entry.status) {
                 "running", "streaming" -> StatusDot(inks.amber, pulsing = true, size = 6)
+                "background" -> Text("In background", style = MaterialTheme.typography.bodySmall, color = inks.amber)
                 "denied" -> Text("Declined", style = MaterialTheme.typography.bodySmall, color = inks.faint)
                 "cancelled" -> Text("Stopped", style = MaterialTheme.typography.bodySmall, color = inks.faint)
-                else -> if (entry.exitCode != null && entry.exitCode != 0) {
+                else -> if (entry.timedOut) {
+                    Text("Timed out", style = MaterialTheme.typography.bodySmall, color = inks.danger)
+                } else if (entry.exitCode != null && entry.exitCode != 0) {
                     Text("exit ${entry.exitCode}", style = SmallCode, color = inks.danger)
                 } else if (entry.status == "error") {
                     Text("Failed", style = MaterialTheme.typography.bodySmall, color = inks.danger)
@@ -422,7 +426,8 @@ private fun Approval(entry: ThreadItem.Tool, onDecide: (String, Boolean) -> Unit
             SelectionContainer { Text(entry.detail, style = SmallCode, color = inks.quiet) }
         }
         Text(when (entry.name) {
-            "bash" -> "Run this command in the worktree?"
+            "bash" -> if (entry.title == "Background bash") "Run this command in the background?"
+                else "Run this command in the worktree?"
             "message_session" -> "Send this question to the other session?"
             "web_search" -> "Send this search query to the search provider?"
             "web_fetch" -> "Fetch this public web page?"
@@ -641,7 +646,7 @@ internal fun ThreadRow(thread: AgentThread, selected: Boolean, onClick: () -> Un
         .clickable(role = Role.Button, onClick = onClick).heightIn(min = 48.dp)
         .padding(horizontal = 12.dp, vertical = 7.dp),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-        StatusDot(threadColor(thread), pulsing = thread.active)
+        StatusDot(threadColor(thread), pulsing = thread.active || thread.backgroundCommands > 0)
         Column(Modifier.weight(1f)) {
             Text(thread.title, style = MaterialTheme.typography.titleSmall, color = inks.ink, maxLines = 1,
                 overflow = TextOverflow.Ellipsis)
@@ -649,9 +654,15 @@ internal fun ThreadRow(thread: AgentThread, selected: Boolean, onClick: () -> Un
                 "waiting" -> "Needs approval"
                 "preparing" -> "Preparing…"
                 "running" -> "Working…"
-                else -> thread.error?.let { "Error" } ?: thread.providerLabel
+                else -> when {
+                    thread.backgroundCommands == 1 -> "1 background command"
+                    thread.backgroundCommands > 1 -> "${thread.backgroundCommands} background commands"
+                    thread.error != null -> "Error"
+                    else -> thread.providerLabel
+                }
             }, style = MaterialTheme.typography.bodySmall,
-                color = if (thread.state == "waiting") inks.accent else if (thread.error != null && !thread.active) inks.danger else inks.faint,
+                color = if (thread.state == "waiting") inks.accent
+                    else if (thread.error != null && !thread.active && thread.backgroundCommands == 0) inks.danger else inks.faint,
                 maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
         if (thread.additions + thread.deletions > 0) DiffStat(thread.additions, thread.deletions)
@@ -662,7 +673,7 @@ internal fun ThreadRow(thread: AgentThread, selected: Boolean, onClick: () -> Un
 @Composable
 internal fun threadColor(thread: AgentThread): Color = when {
     thread.state == "waiting" -> inks.accent
-    thread.active -> inks.amber
+    thread.active || thread.backgroundCommands > 0 -> inks.amber
     thread.error != null -> inks.danger
     else -> inks.faint
 }

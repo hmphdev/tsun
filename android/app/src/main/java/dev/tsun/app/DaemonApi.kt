@@ -95,7 +95,7 @@ internal data class AgentThread(
     val id: String, val workspace: String, val title: String, val state: String, val mode: Mode,
     val provider: String, val providerLabel: String, val model: String, val branch: String?, val filesReady: Boolean,
     val runs: Int, val pendingCall: String?, val additions: Int, val deletions: Int, val filesChanged: Int,
-    val copiedFiles: Int, val error: String?, val canSteer: Boolean,
+    val copiedFiles: Int, val error: String?, val canSteer: Boolean, val backgroundCommands: Int, val canStop: Boolean,
 ) {
     val active get() = state != "idle"
 }
@@ -114,7 +114,7 @@ internal sealed interface ThreadItem {
     data class Tool(
         override val id: String, override val run: Int, val name: String, val title: String, val detail: String,
         val status: String, val output: String?, val exitCode: Int?, val before: String?, val after: String?,
-        val created: Boolean,
+        val created: Boolean, val timedOut: Boolean,
     ) : ThreadItem {
         val risky get() = name == "bash" || name == "write_file" || name == "edit_file"
     }
@@ -340,7 +340,8 @@ private fun JSONObject.thread(): AgentThread = AgentThread(
     model = getString("model"), branch = optStringOrNull("branch"), filesReady = getBoolean("filesReady"),
     runs = getInt("runs"), pendingCall = optStringOrNull("pendingCall"), additions = getInt("additions"),
     deletions = getInt("deletions"), filesChanged = getInt("filesChanged"), copiedFiles = optInt("copiedFiles"),
-    error = optStringOrNull("error"), canSteer = optBoolean("canSteer"),
+    error = optStringOrNull("error"), canSteer = optBoolean("canSteer"), backgroundCommands = optInt("backgroundCommands"),
+    canStop = optBoolean("canStop", getString("state") != "idle"),
 )
 
 private fun JSONObject.fileStat() = FileStat(
@@ -356,7 +357,7 @@ private fun JSONObject.threadItem(): ThreadItem? {
         "thinking" -> ThreadItem.Thinking(id, run, getString("text"), optBoolean("streaming"))
         "tool" -> ThreadItem.Tool(id, run, optString("name"), optString("title"), optString("detail"),
             optString("status"), optStringOrNull("output"), if (has("exitCode") && !isNull("exitCode")) getInt("exitCode") else null,
-            optStringOrNull("before"), optStringOrNull("after"), optBoolean("created"))
+            optStringOrNull("before"), optStringOrNull("after"), optBoolean("created"), optBoolean("timedOut"))
         "notice" -> ThreadItem.Note(id, run, getString("text"), optString("tone") == "error")
         "run" -> ThreadItem.RunEnd(id, run, optLong("duration"), optInt("additions"), optInt("deletions"),
             optInt("copiedFiles"), optInt("copiedLines"),
