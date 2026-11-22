@@ -1,4 +1,5 @@
 #include "agent.hpp"
+#include "env.hpp"
 #include "jobs.hpp"
 #include "workspaces.hpp"
 
@@ -14,7 +15,9 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -327,6 +330,7 @@ int main(int argc, char** argv) {
     }
     try {
         const auto config = tsun::load_config(argv[print_code ? 2 : 1]);
+        tsun::prepare_env(config.state_path);
         ensure_runtime_mounts();
         httplib::SSLServer server(httplib::SSLServer::PemMemory{
             config.certificate.data(), config.certificate.size(), config.private_key.data(), config.private_key.size(),

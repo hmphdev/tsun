@@ -1,5 +1,7 @@
 #include "web_tools.hpp"
 
+#include "env.hpp"
+
 #include <httplib.h>
 #include <libxml/HTMLparser.h>
 
@@ -283,7 +285,7 @@ SearchKeys search_keys(std::string_view variable) {
     SearchKeys keys;
     const std::array<std::string, 2> names{std::string(variable), std::string(variable) + "S"};
     for (const auto& name : names) {
-        const char* raw = std::getenv(name.c_str());
+        const char* raw = tsun::env_get(name.c_str());
         if (!raw) continue;
         std::string_view value(raw);
         while (!value.empty()) {

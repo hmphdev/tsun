@@ -1,5 +1,7 @@
 #include "provider.hpp"
 
+#include "env.hpp"
+
 #include <httplib.h>
 #include <sys/stat.h>
 
@@ -730,7 +732,7 @@ ProviderSettings parse_provider(const Json& entry, const std::string& state_path
     if (!key_file.empty()) settings.api_key = read_key_file(state_path, key_file);
     const auto key_env = string_option(entry, "apiKeyEnv", anthropic ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY");
     if (settings.api_key.empty() && !key_env.empty()) {
-        if (const char* value = std::getenv(key_env.c_str())) settings.api_key = value;
+        if (const char* value = tsun::env_get(key_env.c_str())) settings.api_key = value;
     }
     if (std::any_of(settings.api_key.begin(), settings.api_key.end(), [](unsigned char c) { return c < 33 || c > 126; })) {
         throw std::runtime_error("The API key for " + settings.id + " contains unexpected characters");
