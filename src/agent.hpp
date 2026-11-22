@@ -42,6 +42,9 @@ private:
 
     std::shared_ptr<Thread> find(std::string_view id) const;
     bool effort_command(Thread& thread, const std::string& text);
+    bool compact_command(const std::shared_ptr<Thread>& thread, const std::string& text);
+    void start_compaction(const std::shared_ptr<Thread>& thread, std::string instructions);
+    void work_compaction(const std::shared_ptr<Thread>& thread);
     void begin_run(Thread& thread);
     void start_run(const std::shared_ptr<Thread>& thread, std::string prompt, std::shared_ptr<PeerRequest> peer = {});
     ToolOutcome message_session(Thread& source, const ToolCall& call);

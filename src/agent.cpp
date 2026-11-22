@@ -88,6 +88,222 @@ bool is_effort_command(const std::string& text) {
     return text.rfind("/effort", 0) == 0 && (text.size() == 7 || static_cast<unsigned char>(text[7]) <= ' ');
 }
 
+bool is_compact_command(const std::string& text) {
+    return text.rfind("/compact", 0) == 0 && (text.size() == 8 || static_cast<unsigned char>(text[8]) <= ' ');
+}
+
+// ---- Compaction --------------------------------------------------------------
+// Ported from Pi's /compact (packages/coding-agent/src/core/compaction). A manual
+// compaction keeps the newest turns verbatim, summarizes the rest with one
+// throwaway model call, and replays that summary as the head of the transcript, so
+// a long session keeps going instead of running out of context. Only the model
+// context is compacted: the app still shows every item it already has.
+
+// Pi's keepRecentTokens default: how much of the tail to keep word for word.
+constexpr std::size_t keep_recent_tokens = 20000;
+// Tool output is shortened in the summarization request. The summary only needs to
+// describe what happened, and full results would blow the summary request itself.
+constexpr std::size_t summary_tool_result_limit = 2000;
+// A raster image is not text; Pi charges it this many characters.
+constexpr std::size_t summary_image_chars = 4800;
+
+// A standalone system prompt: the summary call must not inherit the workspace
+// agent prompt, or the model tries to continue the work it is meant to describe.
+constexpr std::string_view summary_system_prompt =
+    "You are a context summarization assistant. Your task is to read a conversation between a user and an AI "
+    "assistant, then produce a structured summary following the exact format specified.\n\n"
+    "Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the "
+    "structured summary.";
+
+constexpr std::string_view summary_prompt = R"PROMPT(The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
+
+Use this EXACT format:
+
+## Goal
+[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]
+
+## Constraints & Preferences
+- [Any constraints, preferences, or requirements mentioned by user]
+- [Or "(none)" if none were mentioned]
+
+## Progress
+### Done
+- [x] [Completed tasks/changes]
+
+### In Progress
+- [ ] [Current work]
+
+### Blocked
+- [Issues preventing progress, if any]
+
+## Key Decisions
+- **[Decision]**: [Brief rationale]
+
+## Next Steps
+1. [Ordered list of what should happen next]
+
+## Critical Context
+- [Any data, examples, or references needed to continue]
+- [Or "(none)" if not applicable]
+
+Keep each section concise. Preserve exact file paths, function names, and error messages.)PROMPT";
+
+// How the summary enters the transcript: the model reads it as the user's words
+// because that is the only history role every provider adapter renders verbatim.
+constexpr std::string_view summary_prefix =
+    "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
+constexpr std::string_view summary_suffix = "\n</summary>";
+
+std::size_t estimate_tokens(const Turn& turn) {
+    // Characters over four is the conservative estimate Pi uses; it overcounts
+    // tokens, so a compaction never cuts more than the transcript can afford.
+    std::size_t chars = turn.text.size();
+    for (const auto& call : turn.calls) {
+        chars += call.name.size();
+        try {
+            chars += call.input.dump().size();
+        } catch (const Json::exception&) {
+            // An unparseable input has no serialized form to charge for.
+        }
+    }
+    for (const auto& result : turn.results) chars += result.image ? summary_image_chars : result.content.size();
+    return (chars + 3) / 4;
+}
+
+std::size_t estimate_history_tokens(const std::vector<Turn>& history) {
+    std::size_t tokens = 0;
+    for (const auto& turn : history) tokens += estimate_tokens(turn);
+    return tokens;
+}
+
+// Keep the beginning and say how much was dropped, without splitting a code point.
+std::string head_limited(const std::string& text, std::size_t limit) {
+    if (text.size() <= limit) return text;
+    auto size = limit;
+    while (size > 0 && (static_cast<unsigned char>(text[size]) & 0xc0) == 0x80) --size;
+    return text.substr(0, size) + "\n\n[... " + std::to_string(text.size() - size) + " more characters truncated]";
+}
+
+// Flatten turns into text so the model summarizes the conversation instead of
+// continuing it. Reasoning is left out, as in Pi: replayed thinking is often not
+// part of the model's live context, and it can be larger than the history itself.
+std::string serialize_history(const std::vector<Turn>& history) {
+    std::string text;
+    const auto add = [&](std::string part) {
+        if (part.empty()) return;
+        if (!text.empty()) text += "\n\n";
+        text += std::move(part);
+    };
+    for (const auto& turn : history) {
+        switch (turn.role) {
+        case Turn::Role::User:
+            if (!turn.text.empty()) add("[User]: " + turn.text);
+            break;
+        case Turn::Role::Assistant: {
+            if (!turn.text.empty()) add("[Assistant]: " + turn.text);
+            std::string calls;
+            for (const auto& call : turn.calls) {
+                if (!calls.empty()) calls += "; ";
+                calls += call.name + "(";
+                bool first = true;
+                if (call.input.is_object()) {
+                    for (const auto& [key, value] : call.input.items()) {
+                        if (!first) calls += ", ";
+                        first = false;
+                        calls += key + "=" + value.dump();
+                    }
+                }
+                calls += ")";
+            }
+            if (!calls.empty()) add("[Assistant tool calls]: " + calls);
+            break;
+        }
+        case Turn::Role::Tools:
+            for (const auto& result : turn.results) {
+                if (result.content.empty()) continue;
+                add("[Tool result]: " + head_limited(result.content, summary_tool_result_limit));
+            }
+            break;
+        }
+    }
+    return text;
+}
+
+// Paths the agent read and changed, so the summary can name them even when the
+// tool calls themselves fall outside the kept tail.
+struct FileOps {
+    std::set<std::string> read, modified;
+};
+
+std::string call_path(const ToolCall& call) {
+    if (!call.input.is_object()) return {};
+    const auto path = call.input.find("path");
+    return path != call.input.end() && path->is_string() ? path->get<std::string>() : std::string{};
+}
+
+FileOps file_operations(const std::vector<Turn>& history) {
+    FileOps ops;
+    for (const auto& turn : history) {
+        for (const auto& call : turn.calls) {
+            const auto path = call_path(call);
+            if (path.empty()) continue;
+            if (call.name == "read_file") ops.read.insert(path);
+            else if (call.name == "write_file" || call.name == "edit_file") ops.modified.insert(path);
+        }
+    }
+    for (const auto& path : ops.modified) ops.read.erase(path);
+    return ops;
+}
+
+std::string format_file_operations(const FileOps& ops) {
+    std::string text;
+    const auto section = [&](std::string_view tag, const std::set<std::string>& paths) {
+        if (paths.empty()) return;
+        text += "\n\n<" + std::string(tag) + ">\n";
+        bool first = true;
+        for (const auto& path : paths) {
+            if (!first) text += "\n";
+            first = false;
+            text += path;
+        }
+        text += "\n</" + std::string(tag) + ">";
+    };
+    section("read-files", ops.read);
+    section("modified-files", ops.modified);
+    return text;
+}
+
+// First turn to keep verbatim; everything before it is summarized. Walk back from
+// the newest turn until the kept tail is worth `keep_recent_tokens`, then cut at
+// the nearest turn a request may start on. A tool-result turn is never a cut
+// point: its assistant tool_use would be summarized away and providers reject the
+// replay, so the cut moves back to that assistant turn, which keeps both.
+std::size_t compaction_cut(const std::vector<Turn>& history) {
+    std::size_t cut = 0;
+    std::size_t accumulated = 0;
+    for (std::size_t i = history.size(); i-- > 0;) {
+        const auto tokens = estimate_tokens(history[i]);
+        if (tokens == 0) continue;
+        accumulated += tokens;
+        if (accumulated < keep_recent_tokens) continue;
+        cut = i;
+        while (cut < history.size() && history[cut].role == Turn::Role::Tools) ++cut;
+        break;
+    }
+    if (cut >= history.size()) {
+        // Trailing tool results blew the budget on their own: keep their call
+        // instead, and report "nothing to compact" if there is no such turn.
+        cut = 0;
+        for (std::size_t i = history.size(); i-- > 0;) {
+            if (history[i].role != Turn::Role::Tools) {
+                cut = i;
+                break;
+            }
+        }
+    }
+    return cut;
+}
+
 std::string first_line(const std::string& text) {
     return trimmed(text.substr(0, text.find('\n')));
 }
@@ -271,6 +487,10 @@ struct Agents::Thread {
     std::string mode = "edits";
     std::string provider_id;
     std::string effort;               // per-session /effort override; empty = provider config
+    // /compact is in flight; the summary call owns the worker, not the agent loop.
+    bool compacting = false;
+    std::string compaction;           // custom instructions for the running compaction
+    std::string compaction_item;      // the notice that reports its progress
     std::string state = "idle"; // preparing, running, waiting, idle
     std::string error;
     std::vector<Turn> history;
@@ -561,7 +781,8 @@ Json Agents::summary(const Thread& thread) const {
         {"model", provider ? provider->settings().model : ""},
         {"branch", thread.branch.empty() ? Json(nullptr) : Json(thread.branch)},
         {"filesReady", bool(thread.root)}, {"runs", thread.runs},
-        {"canSteer", thread.active() && !thread.peer && !thread.cancel},
+        {"canSteer", thread.active() && !thread.peer && !thread.cancel && !thread.compacting},
+        {"compacting", thread.compacting},
         {"pendingCall", thread.pending_call.empty() ? Json(nullptr) : Json(thread.pending_call)},
         {"additions", thread.additions}, {"deletions", thread.deletions}, {"filesChanged", thread.files_changed},
         {"copiedFiles", thread.copied_files}, {"copiedLines", thread.copied_lines},
@@ -733,6 +954,7 @@ Json Agents::send(std::string_view id, const Json& body) {
         if (thread->peer) throw Error(409, "Wait for the read-only session message to finish before replying");
         if (thread->cancel) throw Error(409, "The agent is stopping; wait before replying");
         if (is_effort_command(text)) throw Error(409, "Wait for the run to finish before using /effort");
+        if (is_compact_command(text)) throw Error(409, "Wait for the run to finish before using /compact");
         if (thread->steering.size() >= max_pending_steering) throw Error(409, "Too many steering messages are queued");
         thread->steering.push_back(add_item(*thread, {{"kind", "user"}, {"text", std::move(text)},
             {"steering", "queued"}})["id"].get<std::string>());
@@ -753,6 +975,8 @@ Json Agents::send(std::string_view id, const Json& body) {
     }
     // /effort is a session command, not a message for the model.
     if (effort_command(*thread, text)) return summary(*thread);
+    // /compact summarizes the conversation so far instead of reaching the model as a prompt.
+    if (compact_command(thread, text)) return summary(*thread);
     start_run(thread, std::move(text));
     return summary(*thread);
 }
@@ -784,6 +1008,140 @@ bool Agents::effort_command(Thread& thread, const std::string& text) {
     }
     thread.updated_at = now_ms();
     return true;
+}
+
+bool Agents::compact_command(const std::shared_ptr<Thread>& thread, const std::string& text) {
+    // Called with mutex_ held and the thread idle.
+    if (!is_compact_command(text)) return false;
+    // Anything after the command focuses the summary, like Pi's /compact <focus>.
+    auto instructions = trimmed(text.substr(std::string_view("/compact").size()));
+    const auto* provider = providers_.find(thread->provider_id);
+    if (!provider || !provider->settings().enabled()) {
+        add_item(*thread, {{"kind", "notice"}, {"tone", "error"}, {"text", "The selected model provider is not available."}});
+        return true;
+    }
+    const auto cut = compaction_cut(thread->history);
+    if (cut == 0) {
+        add_item(*thread, {{"kind", "notice"}, {"tone", "error"},
+            {"text", "Nothing to compact yet: the conversation is still smaller than the " +
+                std::to_string(keep_recent_tokens) + " tokens kept word for word."}});
+        return true;
+    }
+    start_compaction(thread, std::move(instructions));
+    return true;
+}
+
+void Agents::start_compaction(const std::shared_ptr<Thread>& thread, std::string instructions) {
+    // Called with mutex_ held and the thread idle. A compaction is not a run: it
+    // does not advance the run counter or checkpoint the worktree, because it only
+    // rewrites the model's view of the conversation. The thread still reports busy
+    // so the app offers Stop, and Stop cancels the summary call like any other.
+    if (thread->worker.joinable()) thread->worker.join();
+    thread->cancel = false;
+    thread->error.clear();
+    thread->compacting = true;
+    thread->compaction = std::move(instructions);
+    thread->state = "running";
+    auto& notice = add_item(*thread, {{"kind", "notice"}, {"tone", "info"},
+        {"text", "Compacting the conversation into a summary…"}});
+    thread->compaction_item = notice["id"].get<std::string>();
+    thread->worker = std::thread([this, thread] { work_compaction(thread); });
+}
+
+void Agents::work_compaction(const std::shared_ptr<Thread>& thread) {
+    std::vector<Turn> history;
+    const Provider* provider = nullptr;
+    std::string effort, instructions;
+    {
+        const std::lock_guard lock(mutex_);
+        history = thread->history;
+        provider = providers_.find(thread->provider_id);
+        effort = thread->effort;
+        instructions = thread->compaction;
+    }
+    const auto cut = compaction_cut(history);
+    const auto tokens_before = estimate_history_tokens(history);
+    // Only the turns outside the kept tail are summarized; their file operations are
+    // named in the summary so paths survive the cut.
+    const std::vector<Turn> covered(history.begin(), history.begin() + static_cast<std::ptrdiff_t>(cut));
+    std::string summary, failure;
+    std::int64_t input_tokens = 0, output_tokens = 0;
+    if (cut == 0) {
+        failure = "the conversation is still smaller than the recent window";
+    } else if (!provider || !provider->settings().enabled()) {
+        failure = "no model provider is available";
+    } else {
+        try {
+            // Summarize those turns as text: the model must describe the
+            // conversation, not continue it. No tools are offered, and the agent's
+            // system prompt is left out for the same reason.
+            std::string prompt = "<conversation>\n" + serialize_history(covered) + "\n</conversation>\n\n";
+            prompt += summary_prompt;
+            if (!instructions.empty()) prompt += "\n\nAdditional focus: " + instructions;
+            const std::vector<Turn> request{{Turn::Role::User, std::move(prompt), {}, {}, {}, {}}};
+            const StreamEvents events; // A summary is machinery; nothing streams into the conversation.
+            const auto reply = provider->stream(std::string(summary_system_prompt), {}, request, events, thread->cancel, effort);
+            input_tokens = reply.input_tokens;
+            output_tokens = reply.output_tokens;
+            // A cut-off summary would silently drop context, so it is never kept.
+            if (reply.stop == StopReason::MaxTokens) throw std::runtime_error("the summary hit the output limit before it finished");
+            if (reply.stop == StopReason::Refusal) throw std::runtime_error("the model declined to summarize this conversation");
+            if (!reply.turn.calls.empty()) throw std::runtime_error("the summary tried to call a tool");
+            summary = trimmed(reply.turn.text);
+            if (summary.empty()) throw std::runtime_error("the model returned an empty summary");
+        } catch (const std::exception& error) {
+            failure = error.what();
+        }
+    }
+
+    std::size_t kept = 0, tokens_after = 0;
+    Json snapshot;
+    {
+        const std::lock_guard lock(mutex_);
+        if (failure.empty() && !thread->cancel && cut > 0) {
+            // The summary becomes the new head of the transcript; the tail stays
+            // verbatim so the next reply still has the recent work in front of it.
+            std::vector<Turn> next;
+            next.reserve(1 + (history.size() - cut));
+            next.push_back({Turn::Role::User,
+                std::string(summary_prefix) + summary + format_file_operations(file_operations(covered)) +
+                    std::string(summary_suffix),
+                {}, {}, {}, {}});
+            for (std::size_t i = cut; i < history.size(); ++i) next.push_back(std::move(history[i]));
+            kept = next.size() - 1;
+            thread->history = std::move(next);
+            tokens_after = estimate_history_tokens(thread->history);
+            thread->input_tokens += input_tokens;
+            thread->output_tokens += output_tokens;
+        }
+        if (auto* notice = item(*thread, thread->compaction_item)) {
+            if (!failure.empty() && !thread->cancel) {
+                (*notice)["tone"] = "error";
+                (*notice)["text"] = "Compaction failed: " + failure;
+            } else if (thread->cancel) {
+                (*notice)["text"] = "Compaction stopped. The conversation is unchanged.";
+            } else {
+                (*notice)["text"] = "Compacted " + std::to_string(cut) + " earlier turns into a summary and kept the "
+                    + std::to_string(kept) + " most recent (about " + std::to_string(tokens_before) + " → "
+                    + std::to_string(tokens_after) + " tokens).";
+            }
+            touch(*thread, *notice);
+        }
+        thread->compacting = false;
+        thread->compaction.clear();
+        thread->compaction_item.clear();
+        thread->state = "idle";
+        ++thread->rev;
+        thread->updated_at = now_ms();
+        snapshot = document(*thread);
+        thread->saved = true;
+        thread->saved_rev = thread->rev;
+        thread->saved_state = thread->state;
+        changed_.notify_all();
+    }
+    // Persist outside the lock, like a run boundary: the next compaction or message
+    // must not wait on the disk.
+    save_thread(snapshot);
 }
 
 Json Agents::update(std::string_view id, const Json& body) {

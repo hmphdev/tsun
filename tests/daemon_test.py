@@ -700,6 +700,103 @@ class DaemonTest(unittest.TestCase):
         thread, items = self.thread_until(thread_id, lambda t, _: t["effort"] is None)
         self.assertIn("reset to the provider default", [e["text"] for e in items if e["kind"] == "notice"][-1])
 
+    def test_compact_command_summarizes_history(self):
+        # Each turn is ~5000 tokens by the chars/4 estimate, so the 20000-token
+        # recent window covers the newest turns and leaves the oldest to summarize.
+        filler = "x" * 20000
+        self.model.script += [
+            anthropic_stream([
+                {"type": "text", "text": filler + " NEEDLE-ONE"},
+                {"type": "tool_use", "id": "toolu_read", "name": "read_file",
+                 "input": {"path": "hello & 日本語.txt"}},
+            ], "tool_use"),
+            anthropic_stream([{"type": "text", "text": filler + " NEEDLE-ONE-DONE"}], "end_turn"),
+            anthropic_stream([{"type": "text", "text": filler + " NEEDLE-TWO"}], "end_turn"),
+            anthropic_stream([{"type": "text", "text": filler + " NEEDLE-THREE"}], "end_turn"),
+            anthropic_stream([{"type": "text", "text": filler + " NEEDLE-FOUR"}], "end_turn"),
+            anthropic_stream([{"type": "text", "text": "## Goal\nKeep the notes tidy."}], "end_turn"),
+            anthropic_stream([{"type": "text", "text": "Continuing after compaction."}], "end_turn"),
+        ]
+        thread_id = self.post("/v1/threads", {"workspace": "demo", "prompt": "Start"}, 201)["id"]
+        route = f"/v1/threads/{thread_id}"
+        self.thread_until(thread_id, lambda t, _: t["state"] == "idle")
+
+        # A short conversation has nothing outside the recent window; no model call.
+        self.post(route + "/messages", {"text": "/compact"}, 202)
+        thread, items = self.thread_until(thread_id, lambda t, i: any(
+            e["kind"] == "notice" and "Nothing to compact yet" in e["text"] for e in i))
+        self.assertEqual(thread["runs"], 1)
+        self.assertEqual(len(self.model.requests), 2)  # the read_file step and the reply
+
+        for index in (1, 2, 3):
+            prompt = f"Turn {index} NEEDLE-PROMPT-{index}"
+            self.post(route + "/messages", {"text": filler + " " + prompt}, 202)
+            thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle" and t["runs"] == index + 1)
+        self.assertEqual(len(self.model.requests), 5)
+
+        # A failed summary leaves the conversation alone: the provider error is
+        # reported and no runs, items of history are lost.
+        replies, self.model.script = self.model.script, []
+        self.post(route + "/messages", {"text": "/compact"}, 202)
+        thread, items = self.thread_until(thread_id, lambda t, i: any(
+            e["kind"] == "notice" and e["text"].startswith("Compaction failed") for e in i))
+        self.assertEqual(thread["runs"], 4)
+        self.assertFalse(thread["compacting"])
+        self.model.script = replies
+
+        # /compact is a session command: it never reaches the model as a prompt, and
+        # it does not count as a run or checkpoint the worktree.
+        attempted = len(self.model.requests)  # the failed summary is the request before this one
+        self.post(route + "/messages", {"text": "/compact focus on the notes"}, 202)
+        thread, items = self.thread_until(thread_id, lambda t, i: any(
+            e["kind"] == "notice" and e["text"].startswith("Compacted") for e in i))
+        self.assertEqual(thread["runs"], 4)
+        self.assertFalse(thread["compacting"])
+        note = next(e["text"] for e in reversed(items) if e["kind"] == "notice")
+        self.assertIn("into a summary and kept the", note)
+
+        # The summary request is a standalone call: its own system prompt, no tools,
+        # and only the turns that fall outside the kept tail, flattened as text.
+        summary = self.model.requests[attempted]["body"]
+        self.assertTrue(summary["system"][0]["text"].startswith("You are a context summarization assistant."))
+        self.assertNotIn("Tsun's coding agent", summary["system"][0]["text"])
+        self.assertEqual(summary["tools"], [])
+        self.assertEqual(len(summary["messages"]), 1)
+        asked = summary["messages"][0]["content"][0]["text"]
+        self.assertIn("<conversation>\n[User]: ", asked)
+        self.assertIn("[Assistant]: ", asked)
+        # Tool calls and their output are described, with long results shortened.
+        self.assertIn('[Assistant tool calls]: read_file(path="hello & 日本語.txt")', asked)
+        self.assertIn("[Tool result]:      1\thello", asked)  # read_file numbers its lines
+        self.assertIn("NEEDLE-PROMPT-1", asked)
+        self.assertNotIn("NEEDLE-PROMPT-3", asked)
+        self.assertTrue(asked.endswith("Additional focus: focus on the notes"))
+
+        # The next reply replays the summary as the head of the conversation, and the
+        # turns it replaced are gone.
+        self.post(route + "/messages", {"text": "Carry on"}, 202)
+        thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle" and t["runs"] == 5)
+        messages = self.model.requests[attempted + 1]["body"]["messages"]
+        self.assertEqual(messages[0]["role"], "user")
+        self.assertTrue(messages[0]["content"][0]["text"].startswith(
+            "The conversation history before this point was compacted into the following summary:"))
+        self.assertIn("## Goal\nKeep the notes tidy.", messages[0]["content"][0]["text"])
+        self.assertIn("<read-files>\nhello & 日本語.txt\n</read-files>", messages[0]["content"][0]["text"])
+        replay = json.dumps(messages)
+        self.assertNotIn("NEEDLE-PROMPT-1", replay)
+        self.assertIn("NEEDLE-PROMPT-3", replay)
+
+        # A command mid-run is refused, like /effort.
+        self.model.script.append(self.model.hang)
+        self.post(route + "/messages", {"text": "Wait"}, 202)
+        deadline = time.monotonic() + 5
+        while len(self.model.requests) <= attempted + 2:
+            self.assertLess(time.monotonic(), deadline, "the model was never called")
+            time.sleep(0.02)
+        self.post(route + "/messages", {"text": "/compact", "steer": True}, 409)
+        self.post(route + "/interrupt", {})
+        self.thread_until(thread_id, lambda t, _: t["state"] == "idle")
+
     def test_steering_replaces_an_unapproved_tool_plan(self):
         self.model.script += [
             anthropic_stream([
