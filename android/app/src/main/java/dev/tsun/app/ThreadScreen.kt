@@ -189,6 +189,7 @@ internal fun ThreadScreen(
             working = current?.active == true, canSend = current != null && provider?.enabled != false, busy = busy,
             canSteer = canSteer,
             canStop = current?.canStop == true,
+            commands = if (current?.active == true) emptyList() else SlashCommands,
             onSend = { text ->
                 val switch = providerId?.takeIf { !canSteer && it != current?.provider }
                 act {
