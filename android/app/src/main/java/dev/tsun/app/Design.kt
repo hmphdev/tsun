@@ -226,6 +226,12 @@ internal fun DiffStat(additions: Int, deletions: Int, modifier: Modifier = Modif
     }
 }
 
+/** Whole files that appeared without the agent writing them, e.g. copied in with a command. */
+@Composable
+internal fun CopiedNote(files: Int, modifier: Modifier = Modifier) {
+    Text("$files copied", modifier, style = SmallCode, color = inks.faint, maxLines = 1)
+}
+
 @Composable
 internal fun RunState(run: Run, modifier: Modifier = Modifier) {
     val label = when (run.state) {
