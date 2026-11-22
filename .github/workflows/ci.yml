@@ -56,8 +56,21 @@ jobs:
           test -r "$sdk/platforms/android-35/android.jar"
           test -x "$sdk/build-tools/35.0.0/aapt2"
           printf 'ANDROID_HOME=%s\n' "$sdk" >> "$GITHUB_ENV"
+      - name: Decode the pinned signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.TSUN_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/tsun.jks"
+            chmod 600 "$RUNNER_TEMP/tsun.jks"
+          fi
       - name: Build and lint
         working-directory: android
+        env:
+          TSUN_KEYSTORE_FILE: ${{ runner.temp }}/tsun.jks
+          TSUN_KEYSTORE_PASSWORD: ${{ secrets.TSUN_KEYSTORE_PASSWORD }}
+          TSUN_KEY_ALIAS: ${{ secrets.TSUN_KEY_ALIAS }}
+          TSUN_KEY_PASSWORD: ${{ secrets.TSUN_KEY_PASSWORD }}
         run: gradle --no-daemon ${{ matrix.tasks }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

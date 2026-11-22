@@ -4,6 +4,11 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose") version "2.1.21"
 }
 
+// CI decodes a pinned keystore into this file so every build can update the
+// previous install in place. Local builds without it fall back to the default
+// debug key.
+val pinnedKeystore = System.getenv("TSUN_KEYSTORE_FILE")?.let(::file)?.takeIf { it.isFile }
+
 android {
     namespace = "dev.tsun.app"
     compileSdk = 35
@@ -18,13 +23,30 @@ android {
 
     buildFeatures { compose = true }
 
+    signingConfigs {
+        if (pinnedKeystore != null) {
+            create("pinned") {
+                storeFile = pinnedKeystore
+                storePassword = System.getenv("TSUN_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("TSUN_KEY_ALIAS")
+                keyPassword = System.getenv("TSUN_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            // CI has no release keystore; sign with the debug key so the APK can still be sideloaded.
-            signingConfig = signingConfigs.getByName("debug")
+            // Keep one key across CI runs: a new debug key per run made every APK
+            // a fresh install that dropped the pairing. Without the secret,
+            // fall back to the debug key so a sideload still works.
+            signingConfig = if (pinnedKeystore != null) signingConfigs.getByName("pinned")
+                else signingConfigs.getByName("debug")
+        }
+        debug {
+            if (pinnedKeystore != null) signingConfig = signingConfigs.getByName("pinned")
         }
     }
 
