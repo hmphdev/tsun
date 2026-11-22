@@ -424,7 +424,7 @@ private fun Approval(entry: ThreadItem.Tool, onDecide: (String, Boolean) -> Unit
         Text(when (entry.name) {
             "bash" -> "Run this command in the worktree?"
             "message_session" -> "Send this question to the other session?"
-            "web_search" -> "Send this search query to Brave?"
+            "web_search" -> "Send this search query to the search provider?"
             "web_fetch" -> "Fetch this public web page?"
             "write_file" -> "Write this file?"
             else -> "Apply this edit?"
