@@ -198,7 +198,7 @@ std::string workspace_guidance(const FileRoot& root) {
 Json turn_to_json(const Turn& turn) {
     Json calls = Json::array();
     for (const auto& call : turn.calls) {
-        calls.push_back({{{"id", call.id}, {"name", call.name}, {"input", call.input}, {"invalid", call.invalid_input}}});
+        calls.push_back(Json{{"id", call.id}, {"name", call.name}, {"input", call.input}, {"invalid", call.invalid_input}});
     }
     Json results = Json::array();
     for (const auto& result : turn.results) {
@@ -221,8 +221,10 @@ Turn turn_from_json(const Json& entry) {
     turn.role = role == "assistant" ? Turn::Role::Assistant : role == "tools" ? Turn::Role::Tools : Turn::Role::User;
     turn.text = entry.value("text", std::string{});
     for (const auto& call : entry.value("calls", Json::array())) {
-        turn.calls.push_back({call.value("id", std::string{}), call.value("name", std::string{}),
-                              call.value("input", Json::object()), call.value("invalid", std::string{})});
+        // Older saves wrapped each call object in a one-element array; accept both shapes.
+        const Json& fields = call.is_array() && call.size() == 1 && call[0].is_object() ? call[0] : call;
+        turn.calls.push_back({fields.value("id", std::string{}), fields.value("name", std::string{}),
+                              fields.value("input", Json::object()), fields.value("invalid", std::string{})});
     }
     for (const auto& result : entry.value("results", Json::array())) {
         ToolResult restored{result.value("call", std::string{}), result.value("name", std::string{}),
