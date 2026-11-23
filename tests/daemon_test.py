@@ -1393,19 +1393,24 @@ class DaemonTest(unittest.TestCase):
         self.assertFalse((worktree / "forbidden.txt").exists())
 
     def test_delegate_can_complete_more_than_eight_tool_rounds(self):
-        self.model.script.append(openai_stream(calls=[("child", "delegate_task", {"task": "Read ten files"})],
+        self.model.script.append(openai_stream(calls=[("child", "delegate_task", {"task": "Read the note ten times"})],
                                                finish="tool_calls"))
         for index in range(10):
-            self.model.script.append(openai_stream(calls=[(f"read_{index}", "read_file", {"path": "notes.txt"})],
+            self.model.script.append(openai_stream(calls=[(f"read_{index}", "read_file", {"path": self.text.name})],
                                                    finish="tool_calls"))
         self.model.script += [openai_stream(content="All ten reads finished."), openai_stream(content="Done.")]
         thread_id = self.post("/v1/threads", {"workspace": "demo", "provider": "local",
                                              "prompt": "Delegate an investigation"}, 201)["id"]
-        _, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle")
+        # This case needs thirteen sequential provider requests, more than the other tests.
+        _, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle", timeout=30)
         child = next(e for e in items if e.get("call") == "child")
         self.assertEqual(child["status"], "done")
         self.assertIn("All ten reads finished", child["output"])
         self.assertEqual(len(self.model.requests), 13)
+        for index, req in enumerate(self.model.requests[2:12]):
+            result = req["body"]["messages"][-1]
+            self.assertEqual(result["tool_call_id"], f"read_{index}")
+            self.assertFalse(result["content"].startswith("Error:"), result["content"])
 
     def test_delegate_reserves_a_tool_free_summary_at_its_call_limit(self):
         reads = [(f"read_{index}", "list_files", {}) for index in range(96)]
