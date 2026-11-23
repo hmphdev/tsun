@@ -1374,14 +1374,14 @@ class DaemonTest(unittest.TestCase):
         self.assertIsNone(thread["error"])
         parent, child, child_followup, parent_followup = [r["body"] for r in self.model.requests]
         self.assertEqual(parent["model"], child["model"])
-        self.assertEqual({t["function"]["name"] for t in child["tools"]}, {"read_file", "list_files"})
+        self.assertEqual({t["function"]["name"] for t in child["tools"]}, {"read_file", "list_files", "search"})
         self.assertIn("read-only subagent", child["messages"][0]["content"])
         self.assertEqual(child["messages"][1:], [{"role": "user", "content": task}])
         child_results = {m["tool_call_id"]: m["content"] for m in child_followup["messages"] if m["role"] == "tool"}
         self.assertIn("committed base", child_results["read_1"])
         self.assertNotIn("uncommitted", child_results["read_1"])
         for call_id in ("write_1", "shell_1", "nested_1"):
-            self.assertIn("only use read_file and list_files", child_results[call_id])
+            self.assertIn("only use read_file, list_files, and search", child_results[call_id])
         self.assertIn("Paths cannot contain ..", child_results["escape_1"])
         tools = [entry for entry in items if entry["kind"] == "tool"]
         self.assertEqual([(e["name"], e["status"], e["title"]) for e in tools], [("delegate_task", "done", "Subagent")])
@@ -1391,6 +1391,103 @@ class DaemonTest(unittest.TestCase):
         self.assertEqual((thread["inputTokens"], thread["outputTokens"]), (80, 20))
         worktree = self.state / "worktrees" / f"isolated-{thread_id}"
         self.assertFalse((worktree / "forbidden.txt").exists())
+
+    def test_delegate_can_complete_more_than_eight_tool_rounds(self):
+        self.model.script.append(openai_stream(calls=[("child", "delegate_task", {"task": "Read the note ten times"})],
+                                               finish="tool_calls"))
+        for index in range(10):
+            self.model.script.append(openai_stream(calls=[(f"read_{index}", "read_file", {"path": self.text.name})],
+                                                   finish="tool_calls"))
+        self.model.script += [openai_stream(content="All ten reads finished."), openai_stream(content="Done.")]
+        thread_id = self.post("/v1/threads", {"workspace": "demo", "provider": "local",
+                                             "prompt": "Delegate an investigation"}, 201)["id"]
+        # This case needs thirteen sequential provider requests, more than the other tests.
+        _, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle", timeout=30)
+        child = next(e for e in items if e.get("call") == "child")
+        self.assertEqual(child["status"], "done")
+        self.assertIn("All ten reads finished", child["output"])
+        self.assertEqual(len(self.model.requests), 13)
+        for index, req in enumerate(self.model.requests[2:12]):
+            result = req["body"]["messages"][-1]
+            self.assertEqual(result["tool_call_id"], f"read_{index}")
+            self.assertFalse(result["content"].startswith("Error:"), result["content"])
+
+    def test_delegate_reserves_a_tool_free_summary_at_its_call_limit(self):
+        reads = [(f"read_{index}", "list_files", {}) for index in range(96)]
+        self.model.script += [
+            openai_stream(calls=[("child", "delegate_task", {"task": "Inventory the project"})], finish="tool_calls"),
+            openai_stream(calls=reads, finish="tool_calls"),
+            openai_stream(content="Inventory summary."),
+            openai_stream(content="Done."),
+        ]
+        thread_id = self.post("/v1/threads", {"workspace": "demo", "provider": "local",
+                                             "prompt": "Delegate the inventory"}, 201)["id"]
+        _, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle")
+        child = next(e for e in items if e.get("call") == "child")
+        self.assertEqual(child["status"], "done")
+        self.assertIn("Inventory summary", child["output"])
+        final = self.model.requests[2]["body"]
+        self.assertEqual(final.get("tools", []), [])
+        self.assertIn("tool budget is exhausted", final["messages"][-1]["content"])
+
+    def test_working_delegate_uses_session_approvals_and_records_edits(self):
+        self.model.script += [
+            openai_stream(calls=[("child", "delegate_task", {"task": "Edit notes", "allow_changes": True})],
+                          finish="tool_calls"),
+            openai_stream(calls=[("edit", "edit_file", {"path": "notes.txt", "old_text": "committed base",
+                                                        "new_text": "edited by subagent"}),
+                                 ("denied", "bash", {"command": "touch not-allowed.txt"}),
+                                 ("checked", "bash", {"command": "cat notes.txt"}),
+                                 ("background", "bash", {"command": "touch not-background.txt", "background": True})],
+                          finish="tool_calls"),
+            openai_stream(content="Edited and checked the note."),
+            openai_stream(content="Done."),
+        ]
+        thread_id = self.post("/v1/threads", {"workspace": "isolated", "provider": "local", "mode": "ask",
+                                             "prompt": "Delegate the edit and verification"}, 201)["id"]
+        worktree = self.state / "worktrees" / f"isolated-{thread_id}"
+        route = f"/v1/threads/{thread_id}"
+        for call_name, decision in (("edit", "allow"), ("denied", "deny"), ("checked", "allow")):
+            thread, items = self.thread_until(thread_id, lambda t, rows: t["state"] == "waiting" and any(
+                e.get("call") == call_name and e["id"] == t["pendingCall"] for e in rows))
+            pending = next(e for e in items if e["id"] == thread["pendingCall"])
+            self.assertTrue(pending["delegated"])
+            if call_name == "edit":
+                self.assertIn("committed base", (worktree / "notes.txt").read_text())
+            self.post(route + "/approval", {"call": thread["pendingCall"], "decision": decision})
+        thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle")
+        self.assertIsNone(thread["error"])
+        tools = [e for e in items if e["kind"] == "tool"]
+        self.assertEqual([(e["call"], e["status"]) for e in tools],
+                         [("child", "done"), ("edit", "done"), ("denied", "denied"), ("checked", "done")])
+        self.assertIn("edited by subagent", tools[-1]["output"])
+        self.assertFalse((worktree / "not-allowed.txt").exists())
+        self.assertFalse((worktree / "not-background.txt").exists())
+        self.assertIn("edited by subagent", self.api("GET", route + "/diff")["diff"])
+        child = self.model.requests[1]["body"]
+        specs = {t["function"]["name"]: t["function"]["parameters"] for t in child["tools"]}
+        self.assertEqual(set(specs), {"read_file", "list_files", "search", "write_file", "edit_file", "bash"})
+        self.assertNotIn("background", specs["bash"]["properties"])
+        self.assertIn("must run in the foreground", self.model.requests[2]["body"]["messages"][-1]["content"])
+
+    def test_steering_cancels_a_pending_subagent_approval(self):
+        self.model.script += [
+            openai_stream(calls=[("child", "delegate_task", {"task": "Write a note", "allow_changes": True})],
+                          finish="tool_calls"),
+            openai_stream(calls=[("write", "write_file", {"path": "not-written.txt", "content": "no"})],
+                          finish="tool_calls"),
+            openai_stream(content="I left the files alone."),
+        ]
+        thread_id = self.post("/v1/threads", {"workspace": "demo", "provider": "local", "mode": "ask",
+                                             "prompt": "Delegate a write"}, 201)["id"]
+        self.thread_until(thread_id, lambda t, _: t["state"] == "waiting")
+        self.post(f"/v1/threads/{thread_id}/messages", {"text": "No edits", "steer": True}, 202)
+        thread, items = self.thread_until(thread_id, lambda t, _: t["state"] == "idle")
+        self.assertIsNone(thread["pendingCall"])
+        self.assertFalse((self.workspace / "not-written.txt").exists())
+        tools = [e for e in items if e["kind"] == "tool"]
+        self.assertEqual([(e["call"], e["status"]) for e in tools], [("child", "error"), ("write", "cancelled")])
+        self.assertEqual(self.model.requests[-1]["body"]["messages"][-1], {"role": "user", "content": "No edits"})
 
     def test_parallel_tools_publish_out_of_order_but_replay_in_order(self):
         release = threading.Event()

@@ -118,7 +118,7 @@ internal sealed interface ThreadItem {
     data class Tool(
         override val id: String, override val run: Int, val name: String, val title: String, val detail: String,
         val status: String, val output: String?, val exitCode: Int?, val before: String?, val after: String?,
-        val created: Boolean, val timedOut: Boolean,
+        val created: Boolean, val timedOut: Boolean, val delegated: Boolean = false,
     ) : ThreadItem {
         val risky get() = name == "bash" || name == "write_file" || name == "edit_file"
     }
@@ -384,7 +384,8 @@ private fun JSONObject.threadItem(): ThreadItem? {
         "thinking" -> ThreadItem.Thinking(id, run, getString("text"), optBoolean("streaming"))
         "tool" -> ThreadItem.Tool(id, run, optString("name"), optString("title"), optString("detail"),
             optString("status"), optStringOrNull("output"), if (has("exitCode") && !isNull("exitCode")) getInt("exitCode") else null,
-            optStringOrNull("before"), optStringOrNull("after"), optBoolean("created"), optBoolean("timedOut"))
+            optStringOrNull("before"), optStringOrNull("after"), optBoolean("created"), optBoolean("timedOut"),
+            optBoolean("delegated"))
         "notice" -> ThreadItem.Note(id, run, getString("text"), optString("tone") == "error")
         "run" -> ThreadItem.RunEnd(id, run, optLong("duration"), optInt("additions"), optInt("deletions"),
             optInt("copiedFiles"), optInt("copiedLines"),

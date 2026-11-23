@@ -2,6 +2,7 @@ package dev.tsun.app
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.lazy.LazyColumn
@@ -27,7 +28,11 @@ import androidx.compose.ui.unit.dp
 internal fun SkillPicker(api: DaemonApi, workspace: String, thread: String?, enabled: Boolean,
                          onPick: (SkillInfo) -> Unit) {
     var open by remember(api, workspace, thread) { mutableStateOf(false) }
-    Chip("Skills", enabled = enabled, trailing = Glyph.Down, onClick = { open = true })
+    TextButton(onClick = { open = true }, enabled = enabled,
+        contentPadding = PaddingValues(horizontal = 8.dp)) {
+        Text("Skills", style = MaterialTheme.typography.labelMedium,
+            color = if (enabled) inks.quiet else inks.faint, maxLines = 1)
+    }
     if (!open) return
 
     var catalog by remember { mutableStateOf<SkillCatalog?>(null) }

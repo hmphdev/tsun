@@ -3,6 +3,8 @@
 #include "provider.hpp"
 
 #include <atomic>
+#include <chrono>
+#include <functional>
 
 namespace tsun {
 
@@ -34,8 +36,13 @@ std::optional<std::string> validate_call(const ToolCall& call, const std::string
 // Short fields the app shows before and while a call runs.
 Json describe_call(const ToolCall& call, const std::string& root_path);
 ToolOutcome run_tool(const ToolContext& context, const ToolCall& call);
-// Foreground, read-only delegation on the parent's model and workspace.
+// Only explicitly opted-in delegates can mutate the parent's workspace.
+bool working_delegate(const ToolCall& call);
+// The session owns tool execution/approval; the child owns its private model history and budget.
+using DelegateExecutor = std::function<ToolOutcome(const ToolContext&, const ToolCall&,
+    std::chrono::steady_clock::time_point)>;
 ToolOutcome run_delegate(const ToolContext& context, const ToolCall& call, const Provider& provider,
-                         const std::string& workspace_guidance, const std::string& effort = {});
+                         const std::string& workspace_guidance, const std::string& effort,
+                         const DelegateExecutor& execute, const std::function<bool()>& steered);
 
 } // namespace tsun

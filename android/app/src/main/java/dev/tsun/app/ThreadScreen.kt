@@ -22,7 +22,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
@@ -168,7 +167,7 @@ internal fun ThreadScreen(
     }
 
     Column(Modifier.fillMaxSize()) {
-        if (current != null) ThreadChips(current, onReview, onFiles)
+        if (current != null) ThreadActions(current, onReview, onFiles)
         Conversation(rows, current, loaded, Modifier.weight(1f),
             onDecide = { call, allow -> act { api.decide(threadId, call, allow) } },
             onReview = onReview)
@@ -178,7 +177,7 @@ internal fun ThreadScreen(
         Composer(
             draft = draft,
             placeholder = when {
-                canSteer -> "Steer the next reply…"
+                canSteer -> "Steer next reply…"
                 current?.active == true -> "The agent is working…"
                 else -> "Reply…"
             },
@@ -197,7 +196,7 @@ internal fun ThreadScreen(
             },
             onStop = { act { api.interrupt(threadId) } },
             modifier = Modifier.padding(start = 12.dp, end = 12.dp, top = 6.dp, bottom = 10.dp),
-            leading = {
+            tools = {
                 if (current != null) SkillPicker(api, current.workspace, threadId,
                     enabled = !current.active && current.filesReady && !busy) { draft.useSkill(it) }
             },
@@ -206,7 +205,7 @@ internal fun ThreadScreen(
 }
 
 @Composable
-private fun ThreadChips(thread: AgentThread, onReview: () -> Unit, onFiles: () -> Unit) {
+private fun ThreadActions(thread: AgentThread, onReview: () -> Unit, onFiles: () -> Unit) {
     val context = LocalContext.current
     val copyId = {
         context.getSystemService(ClipboardManager::class.java)
@@ -215,25 +214,30 @@ private fun ThreadChips(thread: AgentThread, onReview: () -> Unit, onFiles: () -
     }
     // Keep the header above the transcript while its restored scroll position is laid out.
     Row(Modifier.fillMaxWidth().zIndex(1f).clipToBounds().background(inks.paper)
-        .horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 6.dp),
-        horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
-        Chip(thread.branch?.removePrefix("tsun/") ?: "Session ID", glyph = Glyph.Branch, mono = true,
-            modifier = Modifier.semantics { contentDescription = "Copy session ID" }, onClick = copyId)
-        if (thread.branch != null) {
-            Row(Modifier.clip(Pill).background(inks.wash).clickable(role = Role.Button, onClick = onReview)
-                .heightIn(min = 32.dp).padding(horizontal = 11.dp), verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-                LineIcon(Glyph.Diff, color = inks.quiet, size = 14)
-                if (thread.filesChanged == 0) Text("No changes", style = MaterialTheme.typography.labelMedium, color = inks.quiet)
-                else {
-                    Text("${thread.filesChanged} ${if (thread.filesChanged == 1) "file" else "files"}",
-                        style = MaterialTheme.typography.labelMedium, color = inks.quiet)
-                    if (thread.additions + thread.deletions > 0) DiffStat(thread.additions, thread.deletions)
-                    if (thread.copiedFiles > 0) CopiedNote(thread.copiedFiles)
-                }
+        .padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+        TextButton(copyId, Modifier.weight(1f).semantics { contentDescription = "Copy session ID" },
+            contentPadding = PaddingValues(horizontal = 8.dp)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                LineIcon(Glyph.Branch, color = inks.faint, size = 14)
+                Text(thread.branch?.removePrefix("tsun/") ?: "Session ID", Modifier.weight(1f),
+                    style = SmallCode, color = inks.quiet, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
         }
-        if (thread.filesReady) Chip("Files", glyph = Glyph.Folder, onClick = onFiles)
+        if (thread.branch != null) {
+            ThreadAction(if (thread.filesChanged == 0) "Changes" else "Changes (${thread.filesChanged})",
+                Glyph.Diff, onReview)
+        }
+        if (thread.filesReady) ThreadAction("Files", Glyph.Folder, onFiles)
+    }
+}
+
+@Composable
+private fun ThreadAction(label: String, glyph: Glyph, onClick: () -> Unit) {
+    TextButton(onClick, contentPadding = PaddingValues(horizontal = 8.dp)) {
+        LineIcon(glyph, color = inks.accent, size = 16)
+        Spacer(Modifier.width(5.dp))
+        Text(label, style = MaterialTheme.typography.labelMedium, color = inks.accent, maxLines = 1)
     }
 }
 
@@ -333,7 +337,7 @@ private fun UserTurn(entry: ThreadItem.User) {
         SelectionContainer {
             Text(entry.text, Modifier.widthIn(max = 560.dp).clip(RoundedCornerShape(18.dp, 18.dp, 6.dp, 18.dp))
                 .background(inks.raised).border(1.dp, inks.rule, RoundedCornerShape(18.dp, 18.dp, 6.dp, 18.dp))
-                .padding(horizontal = 15.dp, vertical = 11.dp), style = MaterialTheme.typography.bodyLarge, color = inks.ink)
+                .padding(horizontal = 14.dp, vertical = 10.dp), style = ProseType, color = inks.ink)
         }
         val status = when (entry.steering) {
             "queued" -> "Queued for the next reply"
@@ -406,9 +410,14 @@ private fun ToolRow(entry: ThreadItem.Tool, waiting: Boolean, onDecide: (String,
             .heightIn(min = 42.dp).padding(horizontal = 12.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(9.dp)) {
             LineIcon(toolGlyph(entry.name), color = statusColor(entry.status), size = 16)
-            Text(entry.title, style = MaterialTheme.typography.titleSmall, color = inks.ink)
-            Text(entry.detail.substringBefore('\n'), Modifier.weight(1f), style = SmallCode, color = inks.quiet,
-                maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(if (entry.delegated) "Subagent · ${entry.title}" else entry.title,
+                    style = MaterialTheme.typography.titleSmall, color = inks.ink)
+                if (entry.detail.isNotBlank()) {
+                    Text(entry.detail.substringBefore('\n'), style = SmallCode, color = inks.quiet,
+                        maxLines = if (waiting) 3 else 2, overflow = TextOverflow.Ellipsis)
+                }
+            }
             when (entry.status) {
                 "running", "streaming" -> StatusDot(inks.amber, pulsing = true, size = 6)
                 "background" -> Text("In background", style = MaterialTheme.typography.bodySmall, color = inks.amber)
@@ -433,7 +442,10 @@ private fun ToolRow(entry: ThreadItem.Tool, waiting: Boolean, onDecide: (String,
 private fun Approval(entry: ThreadItem.Tool, onDecide: (String, Boolean) -> Unit) {
     Column(Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, bottom = 12.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        if (entry.name == "bash") CodeBlock(entry.detail)
+        if (entry.name == "bash") CodeBlock(entry.detail, label = "Command", selectable = true)
+        if (entry.name == "write_file" || entry.name == "edit_file") {
+            SelectionContainer { Text(entry.detail, style = CodeType, color = inks.ink) }
+        }
         if (entry.name == "message_session" || entry.name == "web_search" || entry.name == "web_fetch") {
             SelectionContainer { Text(entry.detail, style = SmallCode, color = inks.quiet) }
         }
@@ -471,7 +483,7 @@ private fun ToolDetail(entry: ThreadItem.Tool) {
             entry.name == "write_file" && entry.after != null ->
                 if (entry.created) EditPreview("", entry.after) else EditPreview(entry.before.orEmpty(), entry.after)
             else -> {
-                if (entry.name == "bash" && entry.detail.contains('\n')) CodeBlock(entry.detail)
+                if (entry.name == "bash" && entry.detail.contains('\n')) CodeBlock(entry.detail, label = "Command")
                 entry.output?.let { OutputBlock(it) }
             }
         }
@@ -483,15 +495,10 @@ private fun ToolDetail(entry: ThreadItem.Tool) {
 private fun OutputBlock(text: String) {
     var all by remember(text) { mutableStateOf(false) }
     val lines = remember(text) { text.trimEnd().lines() }
-    val shown = if (all || lines.size <= 40) lines else lines.take(40)
-    Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(9.dp)).background(inks.paper.copy(alpha = 0.6f))) {
-        SelectionContainer {
-            Text(shown.joinToString("\n"), Modifier.horizontalScroll(rememberScrollState()).padding(10.dp),
-                style = SmallCode, color = inks.quiet, softWrap = false)
-        }
-        if (shown.size < lines.size) {
-            Text("Show ${lines.size - shown.size} more lines", Modifier.clickable(role = Role.Button) { all = true }
-                .padding(horizontal = 10.dp, vertical = 8.dp), style = MaterialTheme.typography.labelMedium, color = inks.accent)
+    val body = remember(text, all) { (if (all) lines else lines.take(40)).joinToString("\n") }
+    CodeBlock(body, label = "Output", selectable = true) {
+        if (!all && lines.size > 40) {
+            TextButton(onClick = { all = true }) { Text("Show ${lines.size - 40} more lines") }
         }
     }
 }
@@ -588,23 +595,34 @@ internal fun NewSessionScreen(
     val provider = providers.firstOrNull { it.id == (providerId ?: defaultProvider) }
         ?: providers.firstOrNull { it.enabled }
     Column(Modifier.fillMaxSize()) {
-        LazyColumn(Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(horizontal = 24.dp, vertical = 28.dp)) {
+        LazyColumn(Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(horizontal = 20.dp, vertical = 12.dp)) {
             item {
-                Spacer(Modifier.height(36.dp))
-                TsunMark(Modifier.size(30.dp))
-                Spacer(Modifier.height(20.dp))
-                Text("What should we work on?", style = MaterialTheme.typography.headlineLarge, color = inks.ink)
-                Text(when {
+                if (workspace != null) {
+                    Eyebrow("PROJECT", Modifier.padding(bottom = 8.dp))
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        ProjectPicker(workspace, workspaces, enabled = !busy, onWorkspace = onWorkspace,
+                            modifier = Modifier.weight(1f, fill = false))
+                        if (workspace.presets.isNotEmpty()) PresetPicker(workspace.presets, online && !busy, onPreset)
+                    }
+                    Text(if (workspace.worktrees) "Works in a separate Git worktree" else "Edits go directly to this checkout",
+                        Modifier.padding(top = 6.dp), style = MaterialTheme.typography.bodySmall, color = inks.quiet)
+                }
+                val unavailable = when {
                     workspace == null -> "Connect to Debian to load your projects."
-                    provider == null -> "Add a model provider to the daemon's config.json to start a session."
+                    provider == null -> "No model provider configured in the daemon's config.json."
                     !provider.enabled -> provider.reason ?: "This model isn't available."
-                    workspace.worktrees -> "The agent works in ${workspace.label} on its own branch. Your checkout stays as it is."
-                    else -> "The agent works directly in ${workspace.label}."
-                }, Modifier.padding(top = 8.dp), style = MaterialTheme.typography.bodyLarge, color = inks.quiet)
+                    else -> null
+                }
+                unavailable?.let { Notice(it, Modifier.fillMaxWidth().padding(top = 10.dp)) }
             }
-            if (recent.isNotEmpty()) {
-                item { Eyebrow("RECENT", Modifier.padding(top = 34.dp, bottom = 6.dp)) }
-                items(recent.take(5), key = { it.id }) { thread ->
+            if (workspace != null) {
+                item { Eyebrow("RECENT", Modifier.padding(top = 24.dp, bottom = 6.dp)) }
+                if (recent.isEmpty()) item {
+                    Text("No sessions yet", Modifier.padding(top = 4.dp), style = MaterialTheme.typography.bodyMedium,
+                        color = inks.quiet)
+                }
+                items(recent, key = { it.id }) { thread ->
                     ThreadRow(thread, selected = false, onClick = { onOpen(thread) }, onDelete = { onDelete(thread) })
                 }
             }
@@ -612,18 +630,16 @@ internal fun NewSessionScreen(
         error?.let { Notice(it, Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), error = true) }
         Composer(
             draft = draft,
-            placeholder = if (workspace != null) "Describe a task for ${workspace.label}…" else "Describe a task…",
+            placeholder = "Describe a task…",
             mode = mode, onMode = onMode,
             providers = providers, provider = provider, onProvider = { providerId = it.id },
             working = false, canSend = online && workspace != null && provider?.enabled == true, busy = busy,
             onSend = { onStart(it, mode, provider?.id) },
             onStop = {},
             modifier = Modifier.padding(start = 12.dp, end = 12.dp, top = 6.dp, bottom = 10.dp),
-            leading = {
+            tools = {
                 if (workspace != null) SkillPicker(api, workspace.id, thread = null,
                     enabled = online && !busy) { draft.useSkill(it) }
-                ProjectPicker(workspace, workspaces, onWorkspace)
-                if (workspace != null && workspace.presets.isNotEmpty()) PresetPicker(workspace.presets, online && !busy, onPreset)
             },
         )
     }
@@ -636,15 +652,31 @@ private fun TextFieldState.useSkill(skill: SkillInfo) {
 }
 
 @Composable
-private fun ProjectPicker(workspace: Workspace?, workspaces: List<Workspace>, onWorkspace: (Workspace) -> Unit) {
-    var open by remember { mutableStateOf(false) }
-    Box {
-        Chip(workspace?.label ?: "No project", glyph = Glyph.Folder, tint = inks.ink,
-            trailing = if (workspaces.size > 1) Glyph.Down else null,
-            onClick = if (workspaces.size > 1) ({ open = true }) else null)
+private fun ProjectPicker(workspace: Workspace, workspaces: List<Workspace>, enabled: Boolean,
+                          onWorkspace: (Workspace) -> Unit, modifier: Modifier = Modifier) {
+    var open by remember(enabled) { mutableStateOf(false) }
+    Box(modifier) {
+        if (workspaces.size > 1) {
+            TextButton(onClick = { open = true }, enabled = enabled,
+                contentPadding = PaddingValues(horizontal = 8.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    LineIcon(Glyph.Folder, color = inks.accent, size = 16)
+                    Text(workspace.label, Modifier.weight(1f, fill = false), style = MaterialTheme.typography.titleMedium,
+                        color = if (enabled) inks.ink else inks.faint, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    LineIcon(Glyph.Down, color = inks.quiet, size = 12)
+                }
+            }
+        } else {
+            Row(Modifier.heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                LineIcon(Glyph.Folder, color = inks.accent, size = 16)
+                Text(workspace.label, style = MaterialTheme.typography.titleMedium, color = inks.ink,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+        }
         DropdownMenu(expanded = open, onDismissRequest = { open = false }, containerColor = inks.raised) {
             for (choice in workspaces) {
-                DropdownMenuItem(text = { Text(choice.label, color = if (choice.id == workspace?.id) inks.accent else inks.ink) },
+                DropdownMenuItem(text = { Text(choice.label, color = if (choice.id == workspace.id) inks.accent else inks.ink) },
                     onClick = { open = false; onWorkspace(choice) })
             }
         }
@@ -653,9 +685,15 @@ private fun ProjectPicker(workspace: Workspace?, workspaces: List<Workspace>, on
 
 @Composable
 private fun PresetPicker(presets: List<Preset>, enabled: Boolean, onPreset: (Preset) -> Unit) {
-    var open by remember { mutableStateOf(false) }
+    var open by remember(presets, enabled) { mutableStateOf(false) }
     Box {
-        Chip("Presets", glyph = Glyph.Terminal, enabled = enabled, trailing = Glyph.Down, onClick = { open = true })
+        TextButton(onClick = { open = true }, enabled = enabled,
+            contentPadding = PaddingValues(horizontal = 8.dp)) {
+            val tint = if (enabled) inks.quiet else inks.faint
+            Text("Presets", style = MaterialTheme.typography.labelMedium, color = tint, maxLines = 1)
+            Spacer(Modifier.width(4.dp))
+            LineIcon(Glyph.Down, color = tint, size = 12)
+        }
         DropdownMenu(expanded = open, onDismissRequest = { open = false }, containerColor = inks.raised) {
             Text("Run a fixed command instead", Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
                 style = MaterialTheme.typography.bodySmall, color = inks.faint)

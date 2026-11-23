@@ -55,6 +55,7 @@ import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontVariation
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.Hyphens
 import androidx.compose.ui.text.style.LineBreak
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -124,9 +125,12 @@ private val Type = Typography(
     labelMedium = TextStyle(fontFamily = Interface, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, lineHeight = 18.sp),
     labelSmall = TextStyle(fontFamily = Interface, fontWeight = FontWeight.SemiBold, fontSize = 11.sp, lineHeight = 15.sp, letterSpacing = 1.2.sp),
 )
-/** Assistant prose: a reading serif, like a reply rather than a log. */
-internal val ProseType = TextStyle(fontFamily = Reading, fontSize = 17.sp, lineHeight = 26.sp, lineBreak = LineBreak.Paragraph)
-internal val CodeType = TextStyle(fontFamily = Mono, fontSize = 12.5.sp, lineHeight = 19.sp)
+/** Keep comfortable reading sizes; let the system reflow words at large font scales. */
+internal val ProseType = TextStyle(
+    fontFamily = Interface, fontSize = 17.sp, lineHeight = 26.sp,
+    lineBreak = LineBreak.Paragraph, hyphens = Hyphens.Auto,
+)
+internal val CodeType = TextStyle(fontFamily = Mono, fontSize = 12.5.sp, lineHeight = 19.sp, hyphens = Hyphens.None)
 internal val SmallCode = TextStyle(fontFamily = Mono, fontSize = 11.5.sp, lineHeight = 17.sp)
 internal val Corner = RoundedCornerShape(14.dp)
 internal val Pill = RoundedCornerShape(50)
@@ -288,11 +292,12 @@ internal fun RoundAction(glyph: Glyph, label: String, enabled: Boolean, filled: 
         filled -> inks.accent
         else -> inks.raised
     }
-    Box(Modifier.size(38.dp).clip(CircleShape).background(background)
-        .then(if (!filled && enabled) Modifier.border(1.dp, inks.rule, CircleShape) else Modifier)
-        .clickable(enabled = enabled, role = Role.Button, onClick = onClick)
-        .semantics { contentDescription = label }, contentAlignment = Alignment.Center) {
-        LineIcon(glyph, color = if (!enabled) inks.faint else if (filled) inks.onAccent else inks.ink, size = 18)
+    IconButton(onClick, enabled = enabled, modifier = Modifier.semantics { contentDescription = label }) {
+        Box(Modifier.size(38.dp).clip(CircleShape).background(background)
+            .then(if (!filled && enabled) Modifier.border(1.dp, inks.rule, CircleShape) else Modifier),
+            contentAlignment = Alignment.Center) {
+            LineIcon(glyph, color = if (!enabled) inks.faint else if (filled) inks.onAccent else inks.ink, size = 18)
+        }
     }
 }
 
