@@ -52,5 +52,6 @@ if(BUILD_TESTING)
     find_package(Python3 3.8 REQUIRED COMPONENTS Interpreter)
     add_test(NAME daemon.integration COMMAND "${Python3_EXECUTABLE}"
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/daemon_test.py" "$<TARGET_FILE:mobile-harness>")
-    set_tests_properties(daemon.integration PROPERTIES TIMEOUT 180)
+    # The full suite starts a fresh daemon per case and includes sequential model round trips.
+    set_tests_properties(daemon.integration PROPERTIES TIMEOUT 300)
 endif()
