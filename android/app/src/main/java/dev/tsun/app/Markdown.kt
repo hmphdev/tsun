@@ -1,27 +1,44 @@
 package dev.tsun.app
 
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.semantics.heading as headingSemantics
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.SpanStyle
@@ -29,10 +46,12 @@ import androidx.compose.ui.text.TextLinkStyles
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.Hyphens
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.withLink
 import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
@@ -43,7 +62,8 @@ import kotlinx.coroutines.withContext
 private sealed interface Block {
     data class Paragraph(val text: String) : Block
     data class Heading(val level: Int, val text: String) : Block
-    data class Bullet(val marker: String, val text: String, val depth: Int) : Block
+    data class ListItem(val marker: String, val text: String, val depth: Int)
+    data class ListBlock(val items: List<ListItem>) : Block
     data class Quote(val text: String) : Block
     data class Code(val language: String, val text: String) : Block
     data class Table(val header: List<String>, val aligns: List<CellAlign>, val rows: List<List<String>>) : Block
@@ -54,7 +74,9 @@ private enum class CellAlign { Start, Center, End }
 
 private val orderedItem = Regex("^(\\s*)(\\d{1,3})[.)]\\s+(.*)$")
 private val bulletItem = Regex("^(\\s*)[-*+]\\s+(.*)$")
-private val heading = Regex("^(#{1,4})\\s+(.*)$")
+private val headingPattern = Regex("^(#{1,6})\\s+(.*?)(?:\\s+#+)?\\s*$")
+private val setextHeading = Regex("^(=+|-+)\\s*$")
+private val quoteLine = Regex("^>[ \\t]?(.*)$")
 private val tableDivider = Regex("^\\|?\\s*:?-+:?\\s*(\\|\\s*:?-+:?\\s*)*\\|?$")
 
 /** True when the line looks like a table row rather than prose that happens to hold a pipe. */
@@ -89,15 +111,36 @@ private fun alignment(cell: String): CellAlign = when {
 private fun parse(markdown: String): List<Block> {
     val blocks = mutableListOf<Block>()
     val paragraph = StringBuilder()
-    fun flush() {
+    val items = mutableListOf<Block.ListItem>()
+    val quote = StringBuilder()
+
+    fun flushParagraph() {
         if (paragraph.isNotBlank()) blocks += Block.Paragraph(paragraph.toString().trimEnd())
         paragraph.clear()
     }
-    val lines = markdown.replace("\r", "").split('\n')
+    fun flushList() {
+        if (items.isNotEmpty()) blocks += Block.ListBlock(items.map { it.copy(text = it.text.trimEnd()) })
+        items.clear()
+    }
+    fun flushQuote() {
+        if (quote.isNotBlank()) blocks += Block.Quote(quote.toString().trimEnd())
+        quote.clear()
+    }
+    fun flush() {
+        flushParagraph()
+        flushList()
+        flushQuote()
+    }
+
+    val lines = markdown.replace("\r\n", "\n").replace('\r', '\n').split('\n')
     var i = 0
     while (i < lines.size) {
         val line = lines[i]
         val trimmed = line.trimStart()
+        val heading = headingPattern.matchEntire(trimmed)
+        val quoted = quoteLine.matchEntire(trimmed)
+        val bullet = bulletItem.matchEntire(line)
+        val ordered = orderedItem.matchEntire(line)
         // GFM rejects a delimiter row whose cell count differs from the header's. Checking it here also
         // keeps prose that mentions a pipe, followed by a "---" rule, from being read as a one-row table.
         val table = if (tableRow(line) && i + 1 < lines.size && tableDivider.matches(lines[i + 1].trim())) {
@@ -115,12 +158,15 @@ private fun parse(markdown: String): List<Block> {
                 blocks += Block.Code(language, lines.subList(start, i).joinToString("\n"))
             }
             trimmed.isEmpty() -> flush()
-            heading.matches(trimmed) -> {
+            heading != null -> {
                 flush()
-                val match = heading.find(trimmed)!!
-                blocks += Block.Heading(match.groupValues[1].length, match.groupValues[2])
+                blocks += Block.Heading(heading.groupValues[1].length, heading.groupValues[2])
             }
-            trimmed == "---" || trimmed == "***" -> { flush(); blocks += Block.Rule }
+            paragraph.isNotEmpty() && setextHeading.matches(trimmed) -> {
+                blocks += Block.Heading(if (trimmed.startsWith('=')) 1 else 2, paragraph.toString().trimEnd())
+                paragraph.clear()
+            }
+            trimmed == "---" || trimmed == "***" || trimmed == "___" -> { flush(); blocks += Block.Rule }
             table != null -> {
                 flush()
                 val (header, spans) = table
@@ -135,32 +181,40 @@ private fun parse(markdown: String): List<Block> {
                 blocks += Block.Table(header, aligns, rows)
                 i = j - 1
             }
-            bulletItem.matches(line) -> {
-                flush()
-                val match = bulletItem.find(line)!!
-                val body = match.groupValues[2]
+            bullet != null -> {
+                flushParagraph()
+                flushQuote()
+                val body = bullet.groupValues[2]
                 val marker = when {
                     body.startsWith("[x] ", ignoreCase = true) -> "☑"
                     body.startsWith("[ ] ") -> "☐"
                     else -> "•"
                 }
-                blocks += Block.Bullet(marker, if (marker == "•") body else body.drop(4), match.groupValues[1].length / 2)
+                items += Block.ListItem(marker, proseLine(if (marker == "•") body else body.drop(4)), listDepth(bullet))
             }
-            orderedItem.matches(line) -> {
-                flush()
-                val match = orderedItem.find(line)!!
-                blocks += Block.Bullet(match.groupValues[2] + ".", match.groupValues[3], match.groupValues[1].length / 2)
+            ordered != null -> {
+                flushParagraph()
+                flushQuote()
+                items += Block.ListItem(ordered.groupValues[2] + ".", proseLine(ordered.groupValues[3]), listDepth(ordered))
             }
-            trimmed.startsWith(">") -> { flush(); blocks += Block.Quote(trimmed.removePrefix(">").trim()) }
+            quoted != null -> {
+                flushParagraph()
+                flushList()
+                val body = quoted.groupValues[1]
+                if (body.isBlank()) {
+                    if (quote.isNotEmpty() && quote.last() != '\n') quote.append('\n')
+                    if (quote.isNotEmpty()) quote.append('\n')
+                } else quote.appendProseLine(body)
+            }
             else -> {
-                // A continuation line of a list item stays with that item.
-                val last = blocks.lastOrNull()
-                if (paragraph.isEmpty() && last is Block.Bullet && line.startsWith("  ")) {
-                    blocks[blocks.lastIndex] = last.copy(text = last.text + " " + trimmed)
+                flushQuote()
+                val last = items.lastOrNull()
+                if (last != null && (line.startsWith("  ") || line.startsWith('\t'))) {
+                    val text = StringBuilder(last.text).apply { appendProseLine(line) }.toString()
+                    items[items.lastIndex] = last.copy(text = text)
                 } else {
-                    if (paragraph.isNotEmpty() && paragraph.last() != '\n') paragraph.append(' ')
-                    paragraph.append(trimmed.trimEnd())
-                    if (line.endsWith("  ")) paragraph.append('\n')
+                    flushList()
+                    paragraph.appendProseLine(line)
                 }
             }
         }
@@ -168,6 +222,20 @@ private fun parse(markdown: String): List<Block> {
     }
     flush()
     return blocks
+}
+
+private fun listDepth(match: MatchResult): Int = match.groupValues[1].sumOf { if (it == '\t') 4L else 1L }
+    .div(2).coerceAtMost(3).toInt()
+
+private fun proseLine(line: String): String = buildString { appendProseLine(line) }
+
+/** Soft Markdown breaks reflow on the phone; two spaces or a backslash request a hard break. */
+private fun StringBuilder.appendProseLine(line: String) {
+    val body = line.trim()
+    if (isNotEmpty() && last() != '\n') append(' ')
+    val escapedBreak = body.endsWith('\\') && body.takeLastWhile { it == '\\' }.length % 2 == 1
+    append(if (escapedBreak) body.dropLast(1) else body)
+    if (escapedBreak || line.endsWith("  ")) append('\n')
 }
 
 /** Inline Markdown rendered as Compose text, not HTML. */
@@ -268,97 +336,171 @@ private fun bareUrl(text: String, start: Int): String? {
 @Composable
 internal fun MarkdownText(markdown: String, modifier: Modifier = Modifier) {
     val palette = inks
-    val blocks by produceState<List<Pair<Block, AnnotatedString>>>(emptyList(), markdown, palette) {
+    val blocks by produceState<List<DisplayBlock>>(emptyList(), markdown, palette) {
         value = withContext(Dispatchers.Default) {
+            fun style(text: String) = inline(text, palette.ink, palette.wash, palette.accent)
             parse(markdown).map { block ->
                 val text = when (block) {
-                    is Block.Paragraph -> block.text
-                    is Block.Heading -> block.text
-                    is Block.Bullet -> block.text
-                    is Block.Quote -> block.text
-                    is Block.Code, Block.Rule, is Block.Table -> null
+                    is Block.Paragraph -> listOf(style(block.text))
+                    is Block.Heading -> listOf(style(block.text))
+                    is Block.ListBlock -> block.items.map { style(it.text) }
+                    is Block.Quote -> listOf(style(block.text))
+                    is Block.Table -> (listOf(block.header) + block.rows).flatMap { row -> row.map { style(it) } }
+                    is Block.Code, Block.Rule -> emptyList()
                 }
-                block to (text?.let { inline(it, palette.ink, palette.wash, palette.accent) } ?: AnnotatedString(""))
+                DisplayBlock(block, text)
             }
         }
     }
-    Column(modifier, verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        for ((block, styled) in blocks) when (block) {
-            is Block.Paragraph -> Text(styled, style = ProseType, color = palette.ink)
-            is Block.Heading -> Text(styled, Modifier.padding(top = 4.dp),
-                style = ProseType.copy(fontSize = if (block.level <= 2) 20.sp else 18.sp, fontWeight = FontWeight.SemiBold),
-                color = palette.ink)
-            is Block.Bullet -> Row(Modifier.fillMaxWidth().padding(start = (block.depth.coerceAtMost(4) * 16).dp)) {
-                Text(block.marker, Modifier.padding(end = 8.dp), style = ProseType, color = palette.quiet, softWrap = false)
-                Text(styled, Modifier.weight(1f), style = ProseType, color = palette.ink)
+    Column(modifier, verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        for ((index, display) in blocks.withIndex()) {
+            val (block, styled) = display
+            when (block) {
+                is Block.Paragraph -> Text(styled.single(), style = ProseType, color = palette.ink)
+                is Block.Heading -> Text(styled.single(), Modifier.padding(top = if (index == 0) 0.dp else 8.dp)
+                    .semantics { headingSemantics() },
+                    style = ProseType.copy(
+                        fontSize = if (block.level <= 2) 21.sp else 18.sp,
+                        lineHeight = if (block.level <= 2) 29.sp else 25.sp,
+                        fontWeight = FontWeight.SemiBold, hyphens = Hyphens.None,
+                    ), color = palette.ink)
+                is Block.ListBlock -> MarkdownList(block, styled)
+                is Block.Quote -> QuoteBlock(styled.single())
+                is Block.Code -> CodeBlock(block.text, block.language)
+                is Block.Table -> TableBlock(block, styled)
+                Block.Rule -> Box(Modifier.fillMaxWidth().height(1.dp).background(palette.rule))
             }
-            is Block.Quote -> Text(styled, Modifier.fillMaxWidth().drawBehind {
-                drawRect(palette.rule, size = Size(2.dp.toPx(), size.height))
-            }.padding(start = 12.dp), style = ProseType.copy(fontStyle = FontStyle.Italic), color = palette.quiet)
-            is Block.Code -> CodeBlock(block.text, block.language)
-            is Block.Table -> TableBlock(block)
-            Block.Rule -> Box(Modifier.fillMaxWidth().padding(vertical = 4.dp).height(1.dp).background(palette.rule))
+        }
+    }
+}
+
+private data class DisplayBlock(val block: Block, val styled: List<AnnotatedString>)
+
+@Composable
+private fun MarkdownList(list: Block.ListBlock, styled: List<AnnotatedString>) {
+    val fontScale = LocalDensity.current.fontScale
+    val indent = if (fontScale >= 1.3f) 8.dp else 12.dp
+    val markerStyle = ProseType.copy(fontWeight = FontWeight.SemiBold, hyphens = Hyphens.None)
+    Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+        list.items.forEachIndexed { index, item ->
+            Row(Modifier.fillMaxWidth().padding(start = indent * item.depth),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(item.marker, Modifier.alignByBaseline(), style = markerStyle, color = inks.accent, softWrap = false)
+                Text(styled[index], Modifier.weight(1f).alignByBaseline(), style = ProseType, color = inks.ink)
+            }
         }
     }
 }
 
 @Composable
-private fun TableBlock(table: Block.Table) {
+private fun QuoteBlock(text: AnnotatedString) {
     val palette = inks
-    val header = remember(table, palette) { table.header.map { inline(it, palette.ink, palette.wash, palette.accent) } }
-    val rows = remember(table, palette) {
-        table.rows.map { row -> row.map { inline(it, palette.ink, palette.wash, palette.accent) } }
-    }
-    val weights = remember(table) { columnWeights(table.header, table.rows) }
+    val direction = LocalLayoutDirection.current
+    Text(text, Modifier.fillMaxWidth().drawBehind {
+        val width = 2.dp.toPx()
+        val origin = if (direction == LayoutDirection.Ltr) Offset.Zero else Offset(size.width - width, 0f)
+        drawRect(palette.accent.copy(alpha = 0.45f), topLeft = origin, size = Size(width, size.height))
+    }.padding(start = 12.dp, top = 2.dp, bottom = 2.dp), style = ProseType, color = palette.quiet)
+}
+
+@Composable
+private fun TableBlock(table: Block.Table, styled: List<AnnotatedString>) {
+    val palette = inks
+    val columns = table.header.size
+    val preferredWidths = remember(table) { preferredColumnWidths(table) }
+    val scale = LocalDensity.current.fontScale.coerceAtLeast(1f)
     val shape = RoundedCornerShape(10.dp)
-    Column(Modifier.fillMaxWidth().clip(shape).border(1.dp, palette.rule, shape)) {
-        TableRow(header, table.aligns, weights, palette, header = true)
-        for (row in rows) {
-            Box(Modifier.fillMaxWidth().height(1.dp).background(palette.rule))
-            TableRow(row, table.aligns, weights, palette, header = false)
+    val scroll = rememberScrollState()
+    BoxWithConstraints(Modifier.fillMaxWidth()) {
+        // Keep enough room for words without making any one cell wider than the phone.
+        val minimum = minOf(TableColumnMinimum.dp * scale, maxWidth)
+        val preferred = preferredWidths.map { minOf(it.dp * scale, maxWidth).value }
+        val total = preferred.sum().dp
+        val needsScroll = maxWidth < minimum * columns
+        val tableWidth = if (needsScroll) total else minOf(maxWidth, total)
+        val extra = (tableWidth - minimum * columns).value.coerceAtLeast(0f)
+        val demand = preferred.map { it - minimum.value }
+        val totalDemand = demand.sum()
+        val widths = demand.map { (minimum.value + if (totalDemand > 0f) extra * it / totalDemand else 0f)
+            .coerceAtLeast(1f) }
+        Column {
+            val scrollModifier = if (needsScroll) Modifier.horizontalScroll(scroll) else Modifier
+            Column(Modifier.widthIn(max = tableWidth).fillMaxWidth().clip(shape).border(1.dp, palette.rule, shape)
+                .then(scrollModifier).width(tableWidth)) {
+                for (row in 0..table.rows.size) {
+                    if (row > 0) Box(Modifier.fillMaxWidth().height(1.dp).background(palette.rule))
+                    TableRow(styled.subList(row * columns, (row + 1) * columns), table.aligns, widths, palette, row)
+                }
+            }
+            if (needsScroll) {
+                Text("Scroll sideways for more columns", Modifier.padding(top = 4.dp),
+                    style = MaterialTheme.typography.bodySmall, color = palette.quiet)
+            }
         }
     }
 }
 
 @Composable
 private fun TableRow(
-    cells: List<AnnotatedString>, aligns: List<CellAlign>, weights: List<Float>, palette: Inks, header: Boolean,
+    cells: List<AnnotatedString>, aligns: List<CellAlign>, widths: List<Float>, palette: Inks, row: Int,
 ) {
-    Row(Modifier.fillMaxWidth().background(if (header) palette.wash else Color.Transparent)
-        .padding(horizontal = 12.dp, vertical = 9.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+    val header = row == 0
+    val background = when {
+        header -> palette.wash
+        row % 2 == 0 -> palette.sheet
+        else -> Color.Transparent
+    }
+    Row(Modifier.fillMaxWidth().background(background)) {
         cells.forEachIndexed { column, text ->
-            val align = aligns.getOrElse(column) { CellAlign.Start }
-            Text(text, Modifier.weight(weights.getOrElse(column) { 1f }),
+            Text(text, Modifier.weight(widths[column]).padding(horizontal = 10.dp, vertical = 9.dp),
                 style = ProseType.copy(
-                    fontSize = 14.5.sp, lineHeight = 20.sp,
+                    fontSize = 15.sp, lineHeight = 22.sp,
                     fontWeight = if (header) FontWeight.SemiBold else FontWeight.Normal,
                 ),
-                textAlign = when (align) {
+                textAlign = when (aligns[column]) {
                     CellAlign.Start -> TextAlign.Start
                     CellAlign.Center -> TextAlign.Center
                     CellAlign.End -> TextAlign.End
-                },
-                color = if (header) palette.ink else palette.quiet)
+                }, color = palette.ink)
         }
     }
 }
 
-/** Wider columns get proportionally more room, so a "file | status" table does not wrap its names. */
-private fun columnWeights(header: List<String>, rows: List<List<String>>): List<Float> {
-    if (header.isEmpty()) return emptyList()
-    return header.indices.map { column ->
-        (rows.mapNotNull { it.getOrNull(column)?.length } + header[column].length)
-            .maxOrNull()?.toFloat()?.coerceIn(6f, 36f) ?: 6f
-    }
+private const val TableColumnMinimum = 112f
+
+/** Give descriptive columns more space without letting one huge cell dominate the table. */
+private fun preferredColumnWidths(table: Block.Table): List<Float> = table.header.mapIndexed { column, title ->
+    val length = maxOf(title.length, table.rows.maxOfOrNull { it[column].length } ?: 0)
+    (length * 5f + 52f).coerceIn(TableColumnMinimum, 192f)
 }
 
 @Composable
-internal fun CodeBlock(code: String, language: String = "", modifier: Modifier = Modifier) {
-    Column(modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(inks.sheet)) {
-        if (language.isNotEmpty()) {
-            Text(language, Modifier.padding(start = 12.dp, top = 8.dp), style = SmallCode, color = inks.faint)
+private fun CodeText(code: String, wrap: Boolean, scroll: ScrollState) {
+    val body = if (wrap) Modifier.fillMaxWidth() else Modifier.horizontalScroll(scroll)
+    Text(code, body.padding(12.dp), style = CodeType, color = inks.ink, softWrap = wrap)
+}
+
+/** Wrapping only changes layout; selection and copy still see the original text. */
+@Composable
+internal fun CodeBlock(
+    code: String, language: String = "", modifier: Modifier = Modifier, label: String = language.ifBlank { "Code" },
+    selectable: Boolean = false, footer: @Composable () -> Unit = {},
+) {
+    var wrap by rememberSaveable { mutableStateOf(true) }
+    val scroll = rememberScrollState()
+    val shape = RoundedCornerShape(10.dp)
+    Column(modifier.fillMaxWidth().clip(shape).background(inks.sheet).border(1.dp, inks.rule, shape)) {
+        Row(Modifier.fillMaxWidth().background(inks.wash).padding(horizontal = 8.dp),
+            verticalAlignment = Alignment.CenterVertically) {
+            Text(label, Modifier.weight(1f).padding(start = 4.dp),
+                style = MaterialTheme.typography.labelMedium, color = inks.quiet)
+            TextButton(onClick = { wrap = !wrap }, contentPadding = PaddingValues(horizontal = 8.dp)) {
+                Text(if (wrap) "Unwrap" else "Wrap", color = inks.accent)
+            }
         }
-        Text(code, Modifier.horizontalScroll(rememberScrollState()).padding(12.dp), style = CodeType, color = inks.ink,
-            softWrap = false)
+        if (selectable) {
+            SelectionContainer { CodeText(code, wrap, scroll) }
+        } else CodeText(code, wrap, scroll)
+        footer()
     }
 }

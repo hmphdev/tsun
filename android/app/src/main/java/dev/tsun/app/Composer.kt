@@ -3,18 +3,17 @@ package dev.tsun.app
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.horizontalScroll
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
@@ -23,11 +22,13 @@ import androidx.compose.foundation.text.input.InputTransformation
 import androidx.compose.foundation.text.input.TextFieldLineLimits
 import androidx.compose.foundation.text.input.TextFieldState
 import androidx.compose.foundation.text.input.maxLength
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
@@ -73,8 +74,8 @@ internal val SlashCommands = listOf(
 )
 
 /**
- * The rounded message box at the bottom of every conversation: text first, then a
- * row of quiet chips (permission mode, model) and the send/stop actions on the right.
+ * Keep send/stop next to the draft and give the settings their own row, so they
+ * stay visible and in the same place when the agent starts or stops working.
  */
 @Composable
 internal fun Composer(
@@ -93,11 +94,11 @@ internal fun Composer(
     modifier: Modifier = Modifier,
     canSteer: Boolean = false,
     canStop: Boolean = working,
-    leading: @Composable RowScope.() -> Unit = {},
+    tools: @Composable RowScope.() -> Unit = {},
     commands: List<SlashCommand> = emptyList(),
 ) {
     var dismissed by remember(draft) { mutableStateOf("") }
-    val suggestions = remember(draft) {
+    val suggestions = remember(draft, commands) {
         derivedStateOf { matchingCommands(draft, commands, dismissed) }
     }
     var selected by remember(draft) { mutableStateOf(0) }
@@ -111,60 +112,64 @@ internal fun Composer(
             }
             val empty by remember(draft) { derivedStateOf { draft.text.isEmpty() } }
             val hasText by remember(draft) { derivedStateOf { draft.text.isNotBlank() } }
-            BasicTextField(
-                state = draft,
-                inputTransformation = remember { InputTransformation.maxLength(MessageLimit) },
-                modifier = Modifier.fillMaxWidth()
-                    .onFocusChanged { if (it.hasFocus) dismissed = "" }
-                    .onKeyEvent { event ->
-                        commandKeyevent(event, suggestions.value,
-                            onMove = { selected = (selected + it).coerceIn(0, suggestions.value.lastIndex) },
-                            onDismiss = { dismissed = draft.text.toString() },
-                            onComplete = { completeCommand(draft, suggestions.value[selected]) })
-                    }
-                    .semantics { contentDescription = "Message" },
-                enabled = !busy,
-                textStyle = MaterialTheme.typography.bodyLarge.copy(color = inks.ink),
-                cursorBrush = SolidColor(inks.accent),
-                lineLimits = TextFieldLineLimits.MultiLine(maxHeightInLines = 8),
-                keyboardOptions = remember { KeyboardOptions(capitalization = KeyboardCapitalization.Sentences) },
-                decorator = { input ->
-                    Box(Modifier.fillMaxWidth().heightIn(min = 46.dp).padding(horizontal = 12.dp, vertical = 11.dp),
-                        contentAlignment = Alignment.TopStart) {
-                        if (empty) Text(placeholder, color = inks.faint, style = MaterialTheme.typography.bodyLarge,
-                            maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        input()
-                    }
-                },
-            )
-            Row(Modifier.fillMaxWidth().padding(start = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-                Row(Modifier.weight(1f).horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
-                    leading()
-                    ModePicker(mode, onMode)
-                    if (providers.isNotEmpty()) ModelPicker(providers, provider, onProvider, enabled = !working)
-                }
-                Spacer(Modifier.width(8.dp))
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Bottom,
+                horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                BasicTextField(
+                    state = draft,
+                    inputTransformation = remember { InputTransformation.maxLength(MessageLimit) },
+                    modifier = Modifier.weight(1f)
+                        .onFocusChanged { if (it.hasFocus) dismissed = "" }
+                        .onKeyEvent { event ->
+                            val matches = suggestions.value
+                            commandKeyevent(event, matches,
+                                onMove = { selected = (selected + it).coerceIn(0, matches.lastIndex) },
+                                onDismiss = { dismissed = draft.text.toString() },
+                                onComplete = { completeCommand(draft, matches[selected.coerceAtMost(matches.lastIndex)]) })
+                        }
+                        .semantics { contentDescription = "Message" },
+                    enabled = !busy,
+                    textStyle = MaterialTheme.typography.bodyLarge.copy(color = inks.ink),
+                    cursorBrush = SolidColor(inks.accent),
+                    lineLimits = TextFieldLineLimits.MultiLine(maxHeightInLines = 8),
+                    keyboardOptions = remember { KeyboardOptions(capitalization = KeyboardCapitalization.Sentences) },
+                    decorator = { input ->
+                        Box(Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(horizontal = 12.dp, vertical = 11.dp),
+                            contentAlignment = Alignment.TopStart) {
+                            if (empty) Text(placeholder, color = inks.faint, style = MaterialTheme.typography.bodyLarge,
+                                maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            input()
+                        }
+                    },
+                )
                 if (canStop) RoundAction(Glyph.Stop, if (working) "Stop the agent" else "Stop background work",
                     enabled = !busy, filled = false, onClick = onStop)
                 if (!working || canSteer) {
-                    if (canStop) Spacer(Modifier.width(6.dp))
                     RoundAction(Glyph.Up, if (working) "Steer the agent" else "Send",
                         enabled = canSend && !busy && hasText, filled = true) {
                         onSend(draft.text.toString().trim())
                     }
                 }
             }
+            Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                ModePicker(mode, onMode, enabled = !busy)
+                if (providers.isNotEmpty()) {
+                    ModelPicker(providers, provider, onProvider, enabled = !working && !busy, modifier = Modifier.weight(1f))
+                } else {
+                    Spacer(Modifier.weight(1f))
+                }
+                tools()
+            }
         }
     }
 }
 
 @Composable
-private fun ModePicker(mode: Mode, onMode: (Mode) -> Unit) {
-    var open by remember { mutableStateOf(false) }
-    Box {
-        Chip(mode.label, glyph = Glyph.Shield, tint = if (mode == Mode.Full) inks.amber else inks.quiet,
-            trailing = Glyph.Down, onClick = { open = true })
+private fun ModePicker(mode: Mode, onMode: (Mode) -> Unit, enabled: Boolean) {
+    var open by remember(enabled) { mutableStateOf(false) }
+    Box(Modifier.widthIn(max = 144.dp)) {
+        PickerButton(mode.label, "Permissions: ${mode.label}", enabled,
+            color = if (mode == Mode.Full) inks.amber else inks.quiet, glyph = Glyph.Shield) { open = true }
         DropdownMenu(expanded = open, onDismissRequest = { open = false }, containerColor = inks.raised) {
             for (choice in Mode.entries) {
                 DropdownMenuItem(
@@ -185,11 +190,12 @@ private fun ModePicker(mode: Mode, onMode: (Mode) -> Unit) {
 
 @Composable
 private fun ModelPicker(providers: List<ModelProvider>, provider: ModelProvider?, onProvider: (ModelProvider) -> Unit,
-                        enabled: Boolean) {
-    var open by remember { mutableStateOf(false) }
-    Box {
-        Chip(provider?.label ?: "Choose a model", enabled = enabled, trailing = Glyph.Down,
-            tint = if (provider?.enabled == false) inks.danger else inks.quiet, onClick = { open = true })
+                        enabled: Boolean, modifier: Modifier = Modifier) {
+    var open by remember(enabled) { mutableStateOf(false) }
+    val label = provider?.label ?: "Model"
+    Box(modifier) {
+        PickerButton(label, provider?.let { "Model: ${it.label}" } ?: "Choose a model", enabled,
+            color = if (provider?.enabled == false) inks.danger else inks.quiet) { open = true }
         DropdownMenu(expanded = open, onDismissRequest = { open = false }, containerColor = inks.raised) {
             for (choice in providers) {
                 DropdownMenuItem(
@@ -206,6 +212,21 @@ private fun ModelPicker(providers: List<ModelProvider>, provider: ModelProvider?
                     trailingIcon = { if (choice.id == provider?.id) LineIcon(Glyph.Check, color = inks.accent, size = 16) },
                 )
             }
+        }
+    }
+}
+
+@Composable
+private fun PickerButton(label: String, description: String, enabled: Boolean, color: Color,
+                         glyph: Glyph? = null, onClick: () -> Unit) {
+    val tint = if (enabled) color else inks.faint
+    TextButton(onClick, Modifier.semantics { contentDescription = description }, enabled = enabled,
+        contentPadding = PaddingValues(horizontal = 6.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            if (glyph != null) LineIcon(glyph, color = tint, size = 14)
+            Text(label, Modifier.weight(1f, fill = false), style = MaterialTheme.typography.labelMedium,
+                color = tint, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            LineIcon(Glyph.Down, color = tint, size = 12)
         }
     }
 }
